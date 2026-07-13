@@ -19,12 +19,12 @@ The `eureka/` pipeline follows the core EUREKA pattern:
 2. Candidates are validated in a sandbox.
 3. Each candidate is trained with RL for a short budget.
 4. Candidates are evaluated on behavior metrics.
-5. Best candidate is fed back to the LLM as reflection context for the next generation.
+5. Pareto elites are fed back to the LLM as diverse reflection context for the next generation.
 
 ### Expected contribution
 
 - A practical, Windows-compatible implementation of code-level reward evolution for `highway-env`.
-- Safety-conscious reward shaping with explicit anti-gaming fitness computation.
+- Safety-conscious reward shaping with anti-gaming, multi-objective Pareto selection.
 - Incremental LLM integration roadmap:
   - Phase 1: LLM episode judge (`llm_judge.py`)
   - Phase 4: LLM reward code generation (`eureka/`)
@@ -145,7 +145,7 @@ Pipeline abstraction requested:
 ## EUREKA package (`eureka/`)
 
 - `eureka/eureka_config.py`
-  - **Purpose**: search-loop hyperparameters (generations, candidates, train budget, fitness weights, model).
+  - **Purpose**: search-loop hyperparameters (generations, candidates, train budget, objectives/epsilons, model).
 
 - `eureka/loop.py`
   - **Purpose**: evolutionary orchestration loop.
@@ -155,7 +155,7 @@ Pipeline abstraction requested:
     - write candidate code to module file
     - train candidate
     - evaluate candidate
-    - compute fitness and select generation/global best
+    - assign Pareto ranks/crowding and maintain a cross-generation archive
     - persist log (`eureka/eureka_log.json`)
   - **Connections**: hub connecting all eureka components.
 
@@ -185,9 +185,13 @@ Pipeline abstraction requested:
   - **Output metrics**: `crash_rate`, `mean_speed`, `mean_overtakes`, `mean_raw_return`.
   - **Important**: fitness does not use shaped return.
 
+- `eureka/objectives.py`
+  - **Purpose**: epsilon-robust NSGA-II-lite environmental selection.
+  - **Behavior**: mixed min/max dominance, nondominated fronts, normalized
+    crowding, deterministic bounded archive, and diverse reflection elites.
+
 - `eureka/fitness.py`
-  - **Purpose**: scalar ranking score:
-    - `-w_crash*crash_rate + w_speed*mean_speed + w_overtakes*mean_overtakes`.
+  - **Purpose**: legacy scalar diagnostic used only in shadow mode comparison.
 
 - `eureka/reflection.py`
   - **Purpose**: builds LLM feedback prompt from best code + metrics.
@@ -231,7 +235,7 @@ Pipeline abstraction requested:
    - EUREKA: generated function `shaping_reward(ego, road, info)`.
 
 5. **LLM interaction (EUREKA path)**
-   - `build_reflection(best)` creates user prompt.
+   - `build_reflection(elites, target_role)` creates a multi-trade-off prompt.
    - `SYSTEM_PROMPT` enforces contract and constraints.
    - Groq API called via `key_manager`.
 
@@ -250,7 +254,7 @@ Pipeline abstraction requested:
 9. **Reward update/evolution**
    - Fitness computed from crash/speed/overtakes.
    - Generation best and global best tracked.
-   - Best candidate used in next generation reflection prompt.
+   - Diverse rank-zero elites are used in the next generation reflection prompts.
 
 10. **Final result**
    - Printed best module/checkpoint/metrics/code.
@@ -292,7 +296,8 @@ Pipeline abstraction requested:
 
 ### Current limitations
 
-- Fitness still scalarized; trade-offs depend heavily on chosen weights.
+- `MULTI_OBJECTIVE_MODE="shadow"` preserves legacy selection while recording
+  Pareto disagreement; `"pareto"` activates authoritative archive selection.
 - Candidate code execution is constrained but still Python execution.
 - No explicit novelty/diversity pressure beyond prompt instruction.
 
@@ -409,7 +414,8 @@ Pipeline abstraction requested:
 ### Weak points
 
 - Small search budget (`3 x 4` candidates) relative to EUREKA-style exploration.
-- Fitness scalarization may over-reward aggressive policies depending on weights.
+- Legacy scalarization may over-reward aggressive policies; it is diagnostic
+  only once Pareto mode is authoritative.
 - Limited safety sandboxing depth.
 
 ### Technical risks
@@ -427,7 +433,7 @@ Pipeline abstraction requested:
 ### Required ablation studies
 
 - Remove TTC term / overtake term / LLM judge effects.
-- Vary fitness weights and evaluate safety-speed Pareto tradeoff.
+- Validate epsilon sensitivity and archive stability across repeated seeds.
 - Compare deterministic vs stochastic evaluation policy.
 - Compare number of generations/candidates and train budget.
 
@@ -444,14 +450,43 @@ Pipeline abstraction requested:
 1. Add inter-candidate parallel training scheduler.
 2. Introduce archive retrieval and novelty-aware candidate selection.
 3. Add AST-level policy for candidate code safety and complexity limits.
-4. Add multi-objective optimization (safety vs speed Pareto front).
+4. Confirm Pareto finalists across multiple independent PPO training seeds.
 5. Add automated regression suite for reward functions and environment variants.
 6. Integrate structured experiment tracking and report generation.
 7. Distill best evolved reward into interpretable parametric form.
 
 ---
 
-## 11) Running Instructions
+## 11) Multi-objective Selection
+
+The three behavior metrics remain independent objectives:
+
+- `crash_rate`: minimize
+- `mean_speed`: maximize
+- `mean_overtakes`: maximize
+
+`mean_raw_return` remains reporting-only. Candidates are quantized into fixed
+epsilon boxes (`0.10`, `0.5 m/s`, `0.25 overtakes/episode`) before dominance
+sorting so differences below evaluation resolution do not churn the archive.
+Rank is determined by nondominated sorting; crowding distance only truncates a
+front when the bounded archive is full. Candidate IDs provide deterministic
+final ties.
+
+Two rollout modes support safe migration:
+
+- `shadow`: scalar selection remains active, while Pareto rank/archive metadata
+  and scalar/front disagreement are logged.
+- `pareto`: the cross-generation archive is authoritative; the scalar score is
+  diagnostic only and cannot affect survival or reflection.
+
+The LLM acts as the mutation operator. Reflection requests target a balanced
+knee, safest elite, fastest safety-eligible elite, and strongest
+overtaking safety-eligible elite. Optional `CONFIRMATION_SEEDS` retrain rank-zero
+finalists before the final archive is reported.
+
+---
+
+## 12) Running Instructions
 
 ### Installation
 
@@ -463,12 +498,11 @@ pip install -r requirements.txt
 
 ### Dependencies
 
-- Required: `torch`, `gymnasium`, `highway-env`, `numpy`, `matplotlib`
-- Optional LLM: `groq`
+- Required: `torch`, `gymnasium`, `highway-env`, `numpy`, `groq`
 
 ### Configuration
 
-- Baseline and env params: `config.py`
+- Environment/PPO params: `config.py`
 - EUREKA search params: `eureka/eureka_config.py`
 - Groq keys file at repo root:
 
@@ -476,38 +510,10 @@ pip install -r requirements.txt
 {"keys": ["gsk_...", "gsk_..."]}
 ```
 
-### Training commands
-
-- Baseline PPO:
-
-```bash
-python train.py
-```
-
-- Resume baseline training:
-
-```bash
-python train.py --resume checkpoints/ppo_highway_stepXXXX.pt
-```
-
-- EUREKA reward search:
+### Training command
 
 ```bash
 python -m eureka.loop
-```
-
-### Evaluation commands
-
-- Baseline model eval:
-
-```bash
-python evaluate.py --model ppo_highway_scratch.pt --episodes 10
-```
-
-- Rendered eval:
-
-```bash
-python evaluate.py --model ppo_highway_scratch.pt --episodes 10 --render
 ```
 
 ---

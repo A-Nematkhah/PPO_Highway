@@ -15,16 +15,15 @@ reward_wrapper.compute_overtakes) and exposed via info, for two reasons:
        it, as one of the ground-truth fitness metrics in
        eureka/evaluate_candidate.py
 
-A candidate that raises an exception or returns a non-finite/invalid value
-degrades to a zero shaping bonus for that step rather than crashing
+A candidate that raises an exception, times out, or returns a non-finite/invalid
+value degrades to a zero shaping bonus for that step rather than crashing
 training - a bad candidate should train into a "does nothing extra" policy
 and simply score poorly, not take down the whole run.
 """
 
-import math
-
 import gymnasium as gym
 
+from eureka.shaping_call import call_shaping_fn
 from reward_wrapper import compute_overtakes
 
 
@@ -56,14 +55,7 @@ class CandidateRewardWrapper(gym.Wrapper):
             "n_overtakes": n_overtakes,
         }
 
-        try:
-            shaping_value = self.shaping_fn(ego, road, candidate_info)
-            if not isinstance(shaping_value, (int, float)) or not math.isfinite(shaping_value):
-                shaping_value = 0.0
-        except Exception:
-            # a broken candidate should just contribute nothing this step,
-            # not crash the whole training run
-            shaping_value = 0.0
+        shaping_value = call_shaping_fn(self.shaping_fn, ego, road, candidate_info)
 
         shaped_reward = reward + shaping_value
         info["shaping_value"] = shaping_value

@@ -10,6 +10,8 @@ Run this file directly to inspect observation/action space shapes:
     python env_utils.py
 """
 
+import traceback
+
 import numpy as np
 import gymnasium as gym
 import highway_env  # noqa: F401  (registers highway-fast-v0)
@@ -28,6 +30,39 @@ from config import (
     USE_LLM_JUDGE,
 )
 from reward_wrapper import RewardShapingWrapper
+
+# Blocking recv() on a dead/hung worker used to hang the entire EUREKA loop with
+# no error output if env_fn() failed during worker startup. Poll before recv.
+WORKER_INIT_TIMEOUT_S = 30.0
+WORKER_OP_TIMEOUT_S = 60.0
+
+
+def _env_fn_label(env_fn) -> str:
+    """Human-readable context for worker failure messages (module path, seed, ...)."""
+    parts = []
+    module_path = getattr(env_fn, "module_path", None)
+    if module_path is not None:
+        parts.append(f"module_path={module_path!r}")
+    seed = getattr(env_fn, "seed", None)
+    if seed is not None:
+        parts.append(f"seed={seed}")
+    return ", ".join(parts) if parts else repr(env_fn)
+
+
+def _recv_with_timeout(remote, timeout_s: float, context: str = ""):
+    if not remote.poll(timeout_s):
+        suffix = f" ({context})" if context else ""
+        raise RuntimeError(f"Worker timed out after {timeout_s}s{suffix}")
+
+    message = remote.recv()
+    if isinstance(message, tuple) and len(message) == 2:
+        tag, payload = message
+        if tag == "error":
+            suffix = f" ({context})" if context else ""
+            raise RuntimeError(f"Worker failed{suffix}:\n{payload}")
+        if tag == "ok":
+            return payload
+    return message
 
 
 class _EnvFactory:
@@ -89,7 +124,13 @@ class SyncVectorEnv:
     """
 
     def __init__(self, env_fns):
-        self.envs = [fn() for fn in env_fns]
+        self.envs = []
+        for env_fn in env_fns:
+            try:
+                self.envs.append(env_fn())
+            except Exception as e:
+                label = _env_fn_label(env_fn)
+                raise RuntimeError(f"Failed to initialize env for {label}: {e}") from e
         self.n = len(self.envs)
         self.observation_space = self.envs[0].observation_space
         self.action_space = self.envs[0].action_space
@@ -147,33 +188,42 @@ def _worker(remote, parent_remote, env_fn):
     by Stable-Baselines3's SubprocVecEnv.
     """
     parent_remote.close()
-    env = env_fn()
+    try:
+        env = env_fn()
+    except Exception:
+        remote.send(("error", traceback.format_exc()))
+        remote.close()
+        return
 
-    while True:
-        cmd, data = remote.recv()
+    try:
+        while True:
+            cmd, data = remote.recv()
 
-        if cmd == "step":
-            obs, reward, terminated, truncated, info = env.step(int(data))
-            done = terminated or truncated
-            if done:
-                info["terminal_observation"] = obs
+            if cmd == "step":
+                obs, reward, terminated, truncated, info = env.step(int(data))
+                done = terminated or truncated
+                if done:
+                    info["terminal_observation"] = obs
+                    obs, _ = env.reset()
+                remote.send(("ok", (obs, reward, done, info)))
+
+            elif cmd == "reset":
                 obs, _ = env.reset()
-            remote.send((obs, reward, done, info))
+                remote.send(("ok", obs))
 
-        elif cmd == "reset":
-            obs, _ = env.reset()
-            remote.send(obs)
+            elif cmd == "close":
+                env.close()
+                remote.close()
+                break
 
-        elif cmd == "close":
-            env.close()
-            remote.close()
-            break
+            elif cmd == "spaces":
+                remote.send(("ok", (env.observation_space, env.action_space)))
 
-        elif cmd == "spaces":
-            remote.send((env.observation_space, env.action_space))
-
-        else:
-            raise NotImplementedError(f"Unknown command: {cmd}")
+            else:
+                raise NotImplementedError(f"Unknown command: {cmd}")
+    except Exception:
+        remote.send(("error", traceback.format_exc()))
+        remote.close()
 
 
 class AsyncVectorEnv:
@@ -190,6 +240,7 @@ class AsyncVectorEnv:
         import multiprocessing as mp
 
         self.n = len(env_fns)
+        self._env_labels = [_env_fn_label(env_fn) for env_fn in env_fns]
         ctx = mp.get_context("spawn")  # required for reliability on Windows
 
         self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(self.n)])
@@ -201,20 +252,30 @@ class AsyncVectorEnv:
             self.processes.append(process)
             work_remote.close()
 
-        self.remotes[0].send(("spaces", None))
-        self.observation_space, self.action_space = self.remotes[0].recv()
+        for worker_idx, remote in enumerate(self.remotes):
+            remote.send(("spaces", None))
+            context = f"worker {worker_idx} initializing ({self._env_labels[worker_idx]})"
+            spaces = _recv_with_timeout(remote, WORKER_INIT_TIMEOUT_S, context)
+            if worker_idx == 0:
+                self.observation_space, self.action_space = spaces
 
     def reset(self):
-        for remote in self.remotes:
+        for worker_idx, remote in enumerate(self.remotes):
             remote.send(("reset", None))
-        obs = [remote.recv() for remote in self.remotes]
+        obs = []
+        for worker_idx, remote in enumerate(self.remotes):
+            context = f"worker {worker_idx} reset ({self._env_labels[worker_idx]})"
+            obs.append(_recv_with_timeout(remote, WORKER_OP_TIMEOUT_S, context))
         return np.stack(obs)
 
     def step(self, actions):
         for remote, action in zip(self.remotes, actions):
             remote.send(("step", action))
 
-        results = [remote.recv() for remote in self.remotes]
+        results = []
+        for worker_idx, remote in enumerate(self.remotes):
+            context = f"worker {worker_idx} step ({self._env_labels[worker_idx]})"
+            results.append(_recv_with_timeout(remote, WORKER_OP_TIMEOUT_S, context))
         obs, rewards, dones, infos = zip(*results)
         return (
             np.stack(obs),

@@ -6,10 +6,13 @@ Builds a vectorized env for one specific reward candidate.
 Same Windows-multiprocessing constraint as env_utils._EnvFactory: a closure
 capturing the candidate's shaping_fn directly would not be picklable for
 the "spawn" start method. So instead we pass the candidate's MODULE PATH
-(a plain string, trivially picklable) and re-import it fresh inside each
-worker process via importlib. This is exactly why loop.py writes each
-candidate's code to an actual .py file under eureka/candidates/ instead of
-keeping it as an in-memory string.
+(a plain string, trivially picklable) and load it fresh inside each
+worker process. loop.py writes each candidate's code to eureka/candidates/
+so workers can read the source file from disk.
+
+Training-time load uses eureka.sandbox (AST allowlist + restricted exec) —
+the same path as smoke_test.py — NOT importlib.import_module. Workers still
+run inside the parent OS process (no container yet); see docs/SECURITY.md.
 """
 
 import gymnasium as gym
@@ -18,6 +21,7 @@ import highway_env  # noqa: F401  (registers highway-fast-v0)
 from config import ENV_CONFIG, ENV_ID
 from env_utils import AsyncVectorEnv, SyncVectorEnv
 from eureka.candidate_wrapper import CandidateRewardWrapper
+from eureka.sandbox import load_shaping_reward_from_module_path
 
 
 class _CandidateEnvFactory:
@@ -26,17 +30,7 @@ class _CandidateEnvFactory:
         self.module_path = module_path
 
     def __call__(self):
-        import importlib
-
-        # TODO(security): training-time import executes candidate module code with
-        # full worker-process privileges (no AST gate, no restricted builtins).
-        # smoke_test.py validates candidates in a subprocess before write, but
-        # a malicious or compromised .py file on disk would still run unrestricted
-        # here. Longer-term: load candidates in an isolated container/subprocess
-        # with no filesystem/network access, or use a declarative reward DSL
-        # instead of arbitrary Python import.
-        module = importlib.import_module(self.module_path)
-        shaping_fn = module.shaping_reward
+        shaping_fn = load_shaping_reward_from_module_path(self.module_path)
 
         env = gym.make(ENV_ID)
         env.unwrapped.configure(ENV_CONFIG)

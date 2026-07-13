@@ -20,15 +20,16 @@ import highway_env  # noqa: F401
 from config import ENV_CONFIG, ENV_ID, NET_ARCH
 from networks import ActorCritic
 from eureka.candidate_wrapper import CandidateRewardWrapper
+from eureka.logging_utils import get_logger
+from eureka.sandbox import load_shaping_reward_from_module_path
+
+logger = get_logger(__name__)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def evaluate_candidate(model_path: str, module_path: str, n_episodes: int = 10) -> dict:
-    import importlib
-
-    module = importlib.import_module(module_path)
-    shaping_fn = module.shaping_reward
+    shaping_fn = load_shaping_reward_from_module_path(module_path)
 
     env = gym.make(ENV_ID)
     env.unwrapped.configure(ENV_CONFIG)
@@ -73,9 +74,18 @@ def evaluate_candidate(model_path: str, module_path: str, n_episodes: int = 10) 
         overtakes_list.append(overtakes)
         raw_returns.append(raw_return)
 
-        print(f"      ep {episode + 1}/{n_episodes}: "
-              f"speed={mean_ep_speed:.1f} overtakes={overtakes} "
-              f"raw_return={raw_return:.2f} crashed={crashed}", flush=True)
+        logger.info(
+            "eval episode complete",
+            extra={
+                "event": "eval_episode",
+                "episode": episode + 1,
+                "n_episodes": n_episodes,
+                "mean_ep_speed": mean_ep_speed,
+                "overtakes": overtakes,
+                "raw_return": raw_return,
+                "crashed": crashed,
+            },
+        )
 
     env.close()
 

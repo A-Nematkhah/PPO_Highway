@@ -17,7 +17,46 @@ TRAIN_STEPS_PER_CANDIDATE = 50_000
 EUREKA_N_ENVS = 4          # fewer parallel envs than main training (config.N_ENVS=6),
                             # since we're running many short trainings back-to-back
 
-# --- fitness function ---
+# Per-step wall-clock cap on shaping_reward() during training/eval (seconds).
+# Catches candidates that hang only after many calls (invisible to short smoke probes).
+SHAPING_FN_TIMEOUT_S = 0.05
+
+# --- multi-objective selection ---
+# "shadow": compute/log Pareto metadata but preserve legacy scalar selection.
+# "pareto": bounded epsilon/NSGA-II-lite archive is authoritative.
+MULTI_OBJECTIVE_MODE = "shadow"
+
+# Fixed directions, practical-resolution epsilons, and domain bounds. Bounds
+# are used only for the unweighted knee representative, never for dominance.
+OBJECTIVE_SPECS = (
+    {
+        "metric": "crash_rate",
+        "direction": "min",
+        "epsilon": 0.10,
+        "bounds": (0.0, 1.0),
+    },
+    {
+        "metric": "mean_speed",
+        "direction": "max",
+        "epsilon": 0.50,
+        "bounds": (0.0, 40.0),
+    },
+    {
+        "metric": "mean_overtakes",
+        "direction": "max",
+        "epsilon": 0.25,
+        "bounds": (0.0, 10.0),
+    },
+)
+PARETO_ARCHIVE_SIZE = 6
+REFLECTION_ELITES = 3
+
+# Optional confirmation is deliberately off by default because each seed adds
+# a full PPO train/eval. Populate (for example, (10000, 20000)) after shadow
+# analysis to re-check archive finalists before reporting a final front.
+CONFIRMATION_SEEDS = ()
+
+# --- legacy scalar fitness (shadow comparison only) ---
 # fitness = -FITNESS_WEIGHTS["crash"] * crash_rate
 #           + FITNESS_WEIGHTS["speed"] * mean_speed
 #           + FITNESS_WEIGHTS["overtakes"] * mean_overtakes
@@ -30,7 +69,17 @@ FITNESS_WEIGHTS = {
     "overtakes": 0.3,
 }
 
-N_EVAL_EPISODES = 10       # deterministic evaluation episodes used to compute fitness
+N_EVAL_EPISODES = 10       # deterministic evaluation episodes used to compute objectives
+
+
+def candidate_base_seed(generation: int, k: int) -> int:
+    """
+    Base seed for one candidate's vector env. Each candidate in a generation
+    owns a disjoint block of EUREKA_N_ENVS consecutive seeds so sibling
+    candidates never share RNG state across their parallel sub-envs.
+    """
+    return generation * K_CANDIDATES * EUREKA_N_ENVS + k * EUREKA_N_ENVS
+
 
 # --- LLM ---
 GROQ_MODEL = "openai/gpt-oss-120b"  # llama-3.1-70b-versatile / llama-3.3-70b-versatile

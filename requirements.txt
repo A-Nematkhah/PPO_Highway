@@ -6,3 +6,7 @@ matplotlib>=3.7
 
 # optional: only needed if USE_LLM_JUDGE=True in config.py
 groq>=0.9
+
+# dev / CI
+pytest>=8.0
+pytest-cov>=5.0

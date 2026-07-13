@@ -2,7 +2,8 @@
 
 import pytest
 
-from eureka.smoke_test import smoke_test, validate_candidate_ast
+from eureka.sandbox import validate_candidate_ast
+from eureka.smoke_test import smoke_test
 
 _VALID_CANDIDATE = """
 def shaping_reward(ego, road, info):
@@ -36,6 +37,21 @@ def shaping_reward(ego, road, info):
             "    global x\n"
             "    return 0.0\n",
             "global",
+        ),
+        (
+            "def shaping_reward(ego, road, info):\n"
+            '    return "{0.__class__.__bases__}".format(ego)\n',
+            "format",
+        ),
+        (
+            'def shaping_reward(ego, road, info):\n'
+            '    return "{}".format(1)\n',
+            "format",
+        ),
+        (
+            "def shaping_reward(ego, road, info):\n"
+            "    return f\"{ego.__class__}\"\n",
+            "joinedstr",
         ),
     ],
 )

@@ -23,13 +23,12 @@ from networks import ActorCritic
 from ppo import PPOAgent
 from eureka.env_factory import make_candidate_vec_env
 from eureka.eureka_config import EUREKA_N_ENVS
+from eureka.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ROLLING_WINDOW = 20
-
-
-def _fmt_metric(value: float) -> str:
-    return f"{value:9.2f}" if value == value else f"{'n/a':>9}"
 
 
 def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> str:
@@ -68,12 +67,17 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
     finished_overtakes = []
 
     short_name = module_path.split(".")[-1]
-    print(f"    [{short_name}] device={DEVICE}  updates={n_updates}  "
-          f"envs={EUREKA_N_ENVS}  seed={seed}", flush=True)
-    header = (f"    {'update':>6} {'step':>7} {'fps':>5} {'return':>9} "
-              f"{'crash%':>7} {'speed':>7} {'overtk':>7} {'entropy':>8} {'kl':>7}")
-    print(header, flush=True)
-    print("    " + "-" * (len(header) - 4), flush=True)
+    logger.info(
+        "candidate training started",
+        extra={
+            "event": "train_start",
+            "candidate_module": short_name,
+            "device": str(DEVICE),
+            "updates": n_updates,
+            "envs": EUREKA_N_ENVS,
+            "seed": seed,
+        },
+    )
 
     for update in range(1, n_updates + 1):
         buffer.reset()
@@ -149,12 +153,21 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
             mean_speed = float(np.mean(recent_speeds)) if recent_speeds else float("nan")
             mean_overtakes = float(np.mean(recent_overtakes)) if recent_overtakes else float("nan")
 
-            print(
-                f"    {update:>6} {global_step:>7} {fps:>5} "
-                f"{_fmt_metric(mean_return)} {crash_rate:>6.1f}% "
-                f"{_fmt_metric(mean_speed)} {mean_overtakes:>7.2f} "
-                f"{stats['entropy']:>8.3f} {stats['approx_kl']:>7.4f}",
-                flush=True,
+            logger.info(
+                "training update",
+                extra={
+                    "event": "train_update",
+                    "candidate_module": short_name,
+                    "update": update,
+                    "global_step": global_step,
+                    "fps": fps,
+                    "mean_return": mean_return,
+                    "crash_rate_pct": crash_rate,
+                    "mean_speed": mean_speed,
+                    "mean_overtakes": mean_overtakes,
+                    "entropy": stats["entropy"],
+                    "approx_kl": stats["approx_kl"],
+                },
             )
 
     env.close()
@@ -165,6 +178,14 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
     torch.save(model.state_dict(), checkpoint_path)
 
     elapsed = time.time() - start_time
-    print(f"    [{short_name}] done in {elapsed:.1f}s -> {checkpoint_path}", flush=True)
+    logger.info(
+        "candidate training finished",
+        extra={
+            "event": "train_complete",
+            "candidate_module": short_name,
+            "duration_s": round(elapsed, 4),
+            "checkpoint": checkpoint_path,
+        },
+    )
 
     return checkpoint_path

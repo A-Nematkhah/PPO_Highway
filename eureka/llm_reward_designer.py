@@ -11,7 +11,10 @@ code block instead of relying on fragile multi-block parsing.
 import re
 import time
 
+from eureka.logging_utils import get_logger
 from eureka.reflection import build_reflection
+
+logger = get_logger(__name__)
 
 SYSTEM_PROMPT = """You are an expert reward-function designer for a reinforcement \
 learning highway-driving agent (5 discrete actions: change lane left/right, idle, \
@@ -64,11 +67,12 @@ def _extract_code(text: str) -> str | None:
     return None
 
 
-def generate_candidates(best: dict, k: int, generation: int,
+def generate_candidates(elites: dict | list[dict] | None, k: int, generation: int,
                          model: str, temperature: float) -> list[str]:
     """
-    best: the current best candidate dict (or None on generation 0) - used
-          to build the reflection prompt.
+    elites: legacy best dict, Pareto elite list, or None on generation 0.
+            Different calls receive different trade-off targets so the LLM
+            acts as a diverse mutation operator over the archive.
 
     Returns a list of up to k code strings (fewer if some API calls failed
     or didn't contain a parseable code block - loop.py handles that via
@@ -77,12 +81,23 @@ def generate_candidates(best: dict, k: int, generation: int,
     from key_manager import get_key_manager
     manager = get_key_manager()
 
-    user_prompt = build_reflection(best)
-
     candidates = []
+    roles = ("balanced_knee", "safest", "fastest_safe", "overtaking_safe")
     for i in range(k):
-        print(f"  [llm] requesting candidate {i + 1}/{k} from {model}...", flush=True)
-        call_start = time.time()
+        target_role = roles[i % len(roles)] if elites else None
+        user_prompt = build_reflection(elites, target_role=target_role)
+        logger.info(
+            "LLM candidate request",
+            extra={
+                "event": "llm_call_start",
+                "generation": generation,
+                "index": i + 1,
+                "k": k,
+                "model": model,
+                "target_role": target_role,
+            },
+        )
+        call_start = time.perf_counter()
         try:
             response = manager.chat_completion(
                 model=model,
@@ -101,18 +116,42 @@ def generate_candidates(best: dict, k: int, generation: int,
             )
             text = response.choices[0].message.content
             code = _extract_code(text)
-            elapsed = time.time() - call_start
+            elapsed = round(time.perf_counter() - call_start, 4)
             if code:
                 candidates.append(code)
-                print(f"  [llm] candidate {i + 1}/{k}: code received "
-                      f"({len(code.splitlines())} lines, {elapsed:.1f}s)", flush=True)
+                logger.info(
+                    "LLM code received",
+                    extra={
+                        "event": "llm_call_success",
+                        "generation": generation,
+                        "index": i + 1,
+                        "lines": len(code.splitlines()),
+                        "duration_s": elapsed,
+                    },
+                )
             else:
                 preview = (text or "").strip().replace("\n", " ")[:200]
-                print(f"  [llm] candidate {i + 1}/{k}: no code block found "
-                      f"({elapsed:.1f}s), skipping. Preview: {preview!r}", flush=True)
+                logger.warning(
+                    "LLM response had no parseable code",
+                    extra={
+                        "event": "llm_call_no_code",
+                        "generation": generation,
+                        "index": i + 1,
+                        "duration_s": elapsed,
+                        "preview": preview,
+                    },
+                )
         except Exception as e:
-            elapsed = time.time() - call_start
-            print(f"  [llm] candidate {i + 1}/{k}: API call failed "
-                  f"({elapsed:.1f}s): {e}", flush=True)
+            elapsed = round(time.perf_counter() - call_start, 4)
+            logger.error(
+                "LLM API call failed",
+                extra={
+                    "event": "llm_call_error",
+                    "generation": generation,
+                    "index": i + 1,
+                    "duration_s": elapsed,
+                    "error": str(e),
+                },
+            )
 
     return candidates
