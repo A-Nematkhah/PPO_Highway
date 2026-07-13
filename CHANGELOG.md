@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### EUREKA-only cleanup (phase 1)
+- Removed baseline entrypoints: `train.py`, `evaluate.py`, `llm_judge.py`.
+- EUREKA pipeline (`python -m eureka.loop`) unchanged; all 12 tests pass.
+
 ### Security (critical)
 - **smoke_test.py**: Removed `_sanitize_candidate_code()` which stripped `import`
   lines before exec but let the raw code through to disk/import. `smoke_test()`
