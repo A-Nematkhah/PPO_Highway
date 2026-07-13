@@ -74,7 +74,7 @@ def evaluate_candidate(model_path: str, module_path: str, n_episodes: int = 10) 
         overtakes_list.append(overtakes)
         raw_returns.append(raw_return)
 
-        logger.info(
+        logger.debug(
             "eval episode complete",
             extra={
                 "event": "eval_episode",
@@ -89,9 +89,14 @@ def evaluate_candidate(model_path: str, module_path: str, n_episodes: int = 10) 
 
     env.close()
 
-    return {
+    metrics = {
         "crash_rate": crash_count / n_episodes,
         "mean_speed": float(np.mean(speeds)),
         "mean_overtakes": float(np.mean(overtakes_list)),
         "mean_raw_return": float(np.mean(raw_returns)),
     }
+    logger.info(
+        "evaluation complete",
+        extra={"event": "eval_summary", **metrics},
+    )
+    return metrics

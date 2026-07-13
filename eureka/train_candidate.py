@@ -23,7 +23,7 @@ from networks import ActorCritic
 from ppo import PPOAgent
 from eureka.env_factory import make_candidate_vec_env
 from eureka.eureka_config import EUREKA_N_ENVS
-from eureka.logging_utils import get_logger
+from eureka.logging_utils import get_logger, TrainProgressTable
 
 logger = get_logger(__name__)
 
@@ -67,6 +67,7 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
     finished_overtakes = []
 
     short_name = module_path.split(".")[-1]
+    progress = TrainProgressTable(short_name, n_updates)
     logger.info(
         "candidate training started",
         extra={
@@ -153,7 +154,16 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
             mean_speed = float(np.mean(recent_speeds)) if recent_speeds else float("nan")
             mean_overtakes = float(np.mean(recent_overtakes)) if recent_overtakes else float("nan")
 
-            logger.info(
+            progress.add_row(
+                update=update,
+                global_step=global_step,
+                fps=fps,
+                mean_return=mean_return,
+                crash_rate_pct=crash_rate,
+                mean_speed=mean_speed,
+                mean_overtakes=mean_overtakes,
+            )
+            logger.debug(
                 "training update",
                 extra={
                     "event": "train_update",
