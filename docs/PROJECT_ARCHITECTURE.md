@@ -167,10 +167,12 @@ Pipeline abstraction requested:
 - `eureka/smoke_test.py`
   - **Purpose**: pre-train safety/validity check for generated code.
   - **Mechanisms**:
-    - restricted builtins
-    - no imports (sanitizes import lines)
+    - AST gate on the exact code string that will be written/imported (rejects
+      imports, dunder access, exec/eval/open/compile/__import__, global/nonlocal)
+    - restricted builtins + injected `math` for in-subprocess exec probe
     - function existence check
-    - runtime probe on real environment states
+    - runtime probe on real environment states in an isolated subprocess
+    - `n_overtakes` varied across trials (computed + explicit nonzero probes)
     - finite scalar + value-range checks
 
 - `eureka/train_candidate.py`
@@ -333,9 +335,14 @@ Pipeline abstraction requested:
 
 ### Validation/sandbox
 
-- `smoke_test` executes code with restricted builtins and injected `math`.
-- Strips import statements.
+- `smoke_test` AST-gates the exact code string saved to disk (no import stripping).
+- Forbidden: imports, dunder attribute access, exec/eval/open/compile/__import__,
+  global/nonlocal.
+- Runtime probe runs in a spawn subprocess with restricted builtins + injected `math`.
+- Probes real env states with varied `n_overtakes` (computed + explicit nonzero).
 - Ensures callable exists and runtime behavior is numeric/finite/bounded.
+- Training-time import in `env_factory.py` still runs with full worker privileges
+  (documented TODO for container/isolation).
 
 ---
 
@@ -381,11 +388,11 @@ Pipeline abstraction requested:
 | EUREKA Feature | Current Implementation | Missing | Possible Improvement |
 |---|---|---|---|
 | LLM reward generation | Yes (`eureka/llm_reward_designer.py`) | Multi-model ensemble | Evaluate multiple model families per generation |
-| Automatic reward coding | Yes (Python function synthesis) | Typed AST-level constraints | Parse/validate AST before execution |
+| Automatic reward coding | Yes (Python function synthesis) | Full training-time isolation | Containerize candidate import in workers |
 | Evolutionary optimization | Yes (generation loop + best feedback) | Explicit population operators (mutation/crossover) | Add operator-based candidate derivation |
 | Reflection/critique | Yes (`reflection.py`) | Multi-perspective critiques | Add critic prompts per metric failure mode |
 | Reward archive/RAG | Partial (`eureka_log.json`) | Retrieval over historical candidates | Build searchable archive + embedding retrieval |
-| Sandbox execution | Partial (`smoke_test`, restricted builtins) | Process-level isolation limits | Run smoke tests in subprocess/jail container |
+| Sandbox execution | Yes (AST gate + subprocess smoke probe) | Training-time import still full-privilege | Container/jail for env_factory worker import |
 | Parallel training | Intra-candidate env parallelism | Inter-candidate concurrent training | Train multiple candidates concurrently across devices |
 | Experiment management | Basic logs/checkpoints | Reproducible run tracking (e.g., W&B/MLflow) | Add run IDs, config snapshots, artifacts, seeds matrix |
 

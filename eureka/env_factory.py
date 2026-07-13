@@ -28,6 +28,13 @@ class _CandidateEnvFactory:
     def __call__(self):
         import importlib
 
+        # TODO(security): training-time import executes candidate module code with
+        # full worker-process privileges (no AST gate, no restricted builtins).
+        # smoke_test.py validates candidates in a subprocess before write, but
+        # a malicious or compromised .py file on disk would still run unrestricted
+        # here. Longer-term: load candidates in an isolated container/subprocess
+        # with no filesystem/network access, or use a declarative reward DSL
+        # instead of arbitrary Python import.
         module = importlib.import_module(self.module_path)
         shaping_fn = module.shaping_reward
 

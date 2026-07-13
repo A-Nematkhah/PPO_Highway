@@ -188,29 +188,13 @@ class RewardShapingWrapper(gym.Wrapper):
 
     def _compute_overtake_bonus(self):
         """
-        Compares each nearby vehicle's relative longitudinal position to
-        last step. A vehicle that was ahead of ego (relative_x > 0) and is
-        now behind (relative_x <= 0) has just been overtaken.
-
-        Returns (total_bonus, n_overtakes) for this step.
+        Delegates overtake counting to compute_overtakes() so baseline and
+        EUREKA paths share one implementation. Returns (total_bonus,
+        n_overtakes) for this step.
         """
         unwrapped = self.env.unwrapped
         ego = unwrapped.vehicle
-
-        current_relative_x = {}
-        n_overtakes = 0
-
-        for vehicle in unwrapped.road.vehicles:
-            if vehicle is ego:
-                continue
-
-            fingerprint = id(vehicle)  # stable identity, unlike row index
-            relative_x = vehicle.position[0] - ego.position[0]
-            current_relative_x[fingerprint] = relative_x
-
-            prev_relative_x = self._prev_relative_x.get(fingerprint)
-            if prev_relative_x is not None and prev_relative_x > 0 >= relative_x:
-                n_overtakes += 1
-
-        self._prev_relative_x = current_relative_x
+        n_overtakes, self._prev_relative_x = compute_overtakes(
+            unwrapped.road, ego, self._prev_relative_x
+        )
         return self.overtake_bonus * n_overtakes, n_overtakes

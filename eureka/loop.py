@@ -86,6 +86,8 @@ def main():
             print(f"\n  --- candidate {k} ({k + 1}/{len(candidates_code)}) ---", flush=True)
 
             print(f"  [2/4] smoke testing...", flush=True)
+            # smoke_test validates the exact `code` string written below; no
+            # sanitize-and-diverge — AST + subprocess probe gate what gets saved.
             passed, message = smoke_test(code)
             if not passed:
                 print(f"  candidate {k}: REJECTED ({message})", flush=True)

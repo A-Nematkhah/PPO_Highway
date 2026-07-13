@@ -42,18 +42,6 @@ class PPOAgent:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
-    def set_learning_rate(self, lr: float):
-        """
-        Updates the optimizer's learning rate in place. Used for linear LR
-        annealing: calling this with a decaying lr before each update() call
-        stabilizes late-training behavior (large constant LR can keep
-        knocking the policy out of a good region it just found, which shows
-        up as a learning curve that rises early then oscillates instead of
-        converging).
-        """
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
-
     def update(self, b_obs, b_actions, b_log_probs, b_advantages, b_returns, b_values):
         """
         Runs N_EPOCHS of minibatch updates over the flattened rollout data.
