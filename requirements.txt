@@ -1,0 +1,8 @@
+torch>=2.0
+gymnasium>=0.29
+highway-env>=1.8
+numpy>=1.24
+matplotlib>=3.7
+
+# optional: only needed if USE_LLM_JUDGE=True in config.py
+groq>=0.9
