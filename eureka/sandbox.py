@@ -7,6 +7,11 @@ Used by smoke_test.py (pre-train validation) and env_factory.py /
 evaluate_candidate.py (training-time load). Replaces importlib.import_module
 so candidate code never runs with the worker's full builtins.
 
+`shaping_reward` may return either a bare float/int, or a 2-tuple
+`(total_reward: float, reward_components: dict[str, float])` for component-
+level reflection (EUREKA paper Prompt 3). Tuple/Dict/Return are already in
+the AST allowlist, so no extra node types are required for the 2-tuple form.
+
 Security model (Phase 1 hardening):
     - AST whitelist: only explicitly permitted node types / call targets pass.
       New Python syntax features default to REJECT until allowlisted.
@@ -89,6 +94,7 @@ _ALLOWED_NODE_TYPES = frozenset({
     ast.Set,
     ast.ListComp,
     ast.SetComp,
+    ast.GeneratorExp,
     ast.comprehension,
     ast.keyword,
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
@@ -124,6 +130,8 @@ class _WhitelistASTVisitor(ast.NodeVisitor):
         super().visit(node)
 
     def visit_Module(self, node):
+        # shaping_reward may return float OR (total, components: dict);
+        # ast.Tuple / ast.Dict / ast.Return are already allowlisted above.
         fn_defs = [n for n in node.body if isinstance(n, ast.FunctionDef)]
         if len(fn_defs) != 1 or fn_defs[0].name != "shaping_reward":
             self._reject("module must define exactly one function named `shaping_reward`")
@@ -175,6 +183,59 @@ class _WhitelistASTVisitor(ast.NodeVisitor):
                 self._reject(f"call to math.{node.func.attr!r} is not allowed")
                 return
         self.generic_visit(node)
+
+
+def normalize_shaping_output(raw_value) -> tuple[float, dict]:
+    """
+    Accepts whatever shaping_reward() returned and normalizes it to
+    (total: float, components: dict[str, float]).
+
+    - If raw_value is a plain int/float: returns (float(raw_value), {}).
+    - If raw_value is a 2-tuple/list (total, components):
+        - total must be int/float -> cast to float
+        - components must be a dict; any non-numeric or non-finite
+          values inside components are dropped (not errored) so a
+          slightly malformed components dict doesn't crash training,
+          consistent with this project's existing "degrade to zero
+          shaping" philosophy in candidate_wrapper.py
+    - Anything else (wrong arity tuple, wrong types, non-finite total)
+      raises ValueError with a descriptive message. The CALLER (not
+      this function) is responsible for catching that and degrading to
+      0.0, mirroring how shaping_call.py already handles exceptions.
+    """
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        if not math.isfinite(raw_value):
+            raise ValueError(f"non-finite shaping total: {raw_value!r}")
+        return float(raw_value), {}
+
+    if isinstance(raw_value, (tuple, list)):
+        if len(raw_value) != 2:
+            raise ValueError(
+                f"shaping_reward tuple must have length 2, got {len(raw_value)}"
+            )
+        total, components = raw_value
+        if not isinstance(total, (int, float)) or isinstance(total, bool):
+            raise ValueError(f"shaping total must be numeric, got {type(total).__name__}")
+        if not math.isfinite(total):
+            raise ValueError(f"non-finite shaping total: {total!r}")
+        if not isinstance(components, dict):
+            raise ValueError(
+                f"reward_components must be a dict, got {type(components).__name__}"
+            )
+        cleaned: dict[str, float] = {}
+        for key, value in components.items():
+            if not isinstance(key, str):
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if not math.isfinite(value):
+                continue
+            cleaned[key] = float(value)
+        return float(total), cleaned
+
+    raise ValueError(
+        f"shaping_reward must return float or (float, dict), got {type(raw_value).__name__}"
+    )
 
 
 def validate_candidate_ast(code_str: str) -> tuple[bool, str]:

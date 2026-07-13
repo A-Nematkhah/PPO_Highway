@@ -84,6 +84,35 @@ def test_validate_candidate_ast_accepts_minimal_candidate():
     assert message == "ok"
 
 
+def test_validate_candidate_ast_accepts_generator_expression():
+    code = (
+        "def shaping_reward(ego, road, info):\n"
+        "    return sum(v.speed for v in road.vehicles if v is not ego) * 0.01\n"
+    )
+    passed, message = validate_candidate_ast(code)
+    assert passed is True
+    assert message == "ok"
+
+
 def test_smoke_test_accepts_valid_candidate():
     passed, message = smoke_test(_VALID_CANDIDATE, n_trials=2)
     assert passed is True, message
+
+
+def test_smoke_test_accepts_component_tuple_return():
+    code = (
+        "def shaping_reward(ego, road, info):\n"
+        "    return 0.1, {'a': 0.05, 'b': 0.05}\n"
+    )
+    passed, message = smoke_test(code, n_trials=2)
+    assert passed is True, message
+
+
+def test_smoke_test_rejects_malformed_tuple_return():
+    code = (
+        "def shaping_reward(ego, road, info):\n"
+        "    return 0.1, 0.2, 0.3\n"
+    )
+    passed, message = smoke_test(code, n_trials=1)
+    assert passed is False
+    assert "length 2" in message.lower() or "tuple" in message.lower()

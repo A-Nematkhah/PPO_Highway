@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Component-level reward reflection (EUREKA paper Sec 3.3 / Prompt 3)
+- shaping_reward() may now optionally return (total: float, components:
+  dict[str, float]) instead of a bare float, mirroring the EUREKA
+  paper's reward_components output format. Backward compatible: bare
+  float returns still work unchanged.
+- eureka/sandbox.py: added normalize_shaping_output() to unify both
+  return forms with graceful degradation on malformed output.
+- eureka/train_candidate.py: accumulates per-component rolling-window
+  snapshots during training, written to a checkpoint sidecar JSON file.
+- eureka/evaluate_candidate.py: reports component_means alongside
+  existing crash_rate/mean_speed/mean_overtakes/mean_raw_return metrics.
+- eureka/reflection.py: includes component means and chronological
+  training snapshots in the LLM feedback prompt when available, per
+  "Reward reflection enables targeted improvement" (paper Sec 4.3,
+  reports 28.6% score drop without this granularity).
+- No change to training budget, candidate count, or LLM call count.
+
+### Human reward initialization (EUREKA paper Sec 4.4)
+- Added `eureka/human_seed.py`: hand-written shaping_reward ported from
+  reward_wrapper.py's TTC penalty + overtake bonus, used as an extra
+  generation-0 candidate (not counted against K_CANDIDATES) so its real
+  trained metrics seed the Pareto archive/reflection context, per
+  "EUREKA can improve and benefit from human reward functions" (Ma et
+  al., ICLR 2024). Adds one extra train+eval run, generation 0 only.
+  Toggle: `SEED_GENERATION_0_WITH_HUMAN_REWARD` in eureka_config.py.
+
 ### Multi-objective Pareto / NSGA-II-lite selection
 - Added `eureka/objectives.py`: epsilon-box dominance, nondominated sorting,
   normalized crowding distance, deterministic bounded archive, unweighted knee

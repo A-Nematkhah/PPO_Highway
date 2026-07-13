@@ -24,8 +24,17 @@ reward (which already penalizes collisions and rewards speed). Your term should 
 encourage nuanced, skillful behavior - safe overtaking, maintaining safe following \
 distance, smooth lane changes - without simply duplicating collision/speed rewards.
 
-Function contract (must match exactly):
-    def shaping_reward(ego, road, info: dict) -> float:
+Function contract:
+    def shaping_reward(ego, road, info: dict):
+        # Prefer returning (total_reward, reward_components) so future revisions
+        # can see which term is under/over-scaled (EUREKA paper Prompt 3).
+        # A bare float is still accepted as a fallback.
+        ttc_temp = 5.0
+        ...
+        ttc_component = ...
+        overtake_component = ...
+        total = ttc_component + overtake_component
+        return total, {"ttc_penalty": ttc_component, "overtake_bonus": overtake_component}
 
 Available attributes:
 - ego.position: [x, y] (x = longitudinal position along the road, y = lateral position)
@@ -40,8 +49,20 @@ Available attributes:
 Constraints:
 - The `math` module is already available in scope - do NOT write any import
   statements (no `import math`, no `from ... import ...`, no numpy)
-- Return a single float, roughly in [-1, 1] per step (it's added on top of an
-  already-normalized base reward)
+- If you apply a transformation (e.g. math.exp, math.tanh, a sigmoid-like
+  squashing, or any function with a tunable scale/steepness constant) to
+  a reward term, expose that constant as a locally-assigned named
+  variable inside the function body (e.g. `ttc_temp = 5.0` used as
+  `math.exp(-ttc_temp * severity)`), rather than an inline numeric
+  literal. Use a descriptive name that indicates what it scales (e.g.
+  `ttc_temp`, `overtake_scale`, `speed_bonus_weight`). This keeps future
+  revisions of this function easy to tune precisely.
+- Return either a single float OR a 2-tuple
+  `(total_reward: float, reward_components: dict[str, float])`. Prefer the
+  2-tuple form: expose named sub-terms that combine into total_reward so
+  later feedback can revise specific components. total_reward should be
+  roughly in [-1, 1] per step (it's added on top of an already-normalized
+  base reward). Components are diagnostic only — training uses total_reward.
 - This function is called every single step - do not reference terminal/episode state
 - Respond with ONLY one fenced ```python code block containing the complete function
   definition. No explanation, no other text.

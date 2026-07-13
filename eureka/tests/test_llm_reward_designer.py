@@ -2,9 +2,15 @@
 
 from unittest.mock import MagicMock, patch
 
-from eureka.llm_reward_designer import _extract_code, generate_candidates
+from eureka.llm_reward_designer import SYSTEM_PROMPT, _extract_code, generate_candidates
 
 _VALID = "def shaping_reward(ego, road, info):\n    return 0.0\n"
+
+
+def test_system_prompt_mentions_named_temperature_variable():
+    lowered = SYSTEM_PROMPT.lower()
+    assert "named" in lowered
+    assert "temp" in lowered or "scale" in lowered
 
 
 @patch("key_manager.get_key_manager")

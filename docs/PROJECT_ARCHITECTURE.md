@@ -146,11 +146,17 @@ Pipeline abstraction requested:
 
 - `eureka/eureka_config.py`
   - **Purpose**: search-loop hyperparameters (generations, candidates, train budget, objectives/epsilons, model).
+  - Includes `SEED_GENERATION_0_WITH_HUMAN_REWARD` (extra human-authored candidate in generation 0 only).
+
+- `eureka/human_seed.py`
+  - **Purpose**: hand-written `shaping_reward` ported from `reward_wrapper.py` (TTC penalty + overtake bonus via `info["n_overtakes"]`).
+  - Used as an extra generation-0 candidate so real trained metrics seed the Pareto archive / reflection context ("EUREKA from Human Initialization", Ma et al., ICLR 2024, Sec 4.4). Not repeated in later generations.
 
 - `eureka/loop.py`
   - **Purpose**: evolutionary orchestration loop.
   - **Main flow**:
     - generate candidates with LLM
+    - (generation 0, optional) prepend human seed from `human_seed.py`
     - smoke-test each candidate
     - write candidate code to module file
     - train candidate
@@ -163,6 +169,9 @@ Pipeline abstraction requested:
   - **Purpose**: prompt + parse LLM reward function code.
   - **Main elements**: `SYSTEM_PROMPT`, `_extract_code`, `generate_candidates(...)`.
   - **Behavior**: one API call per candidate (not one call for all K), with parsing fallbacks.
+  - **Return contract**: `shaping_reward` may return a bare float (legacy) or
+    `(total, reward_components: dict)` (preferred) for component-level reflection
+    (EUREKA paper Prompt 3). Float-only remains fully valid.
 
 - `eureka/smoke_test.py`
   - **Purpose**: pre-train safety/validity check for generated code.
@@ -194,7 +203,9 @@ Pipeline abstraction requested:
   - **Purpose**: legacy scalar diagnostic used only in shadow mode comparison.
 
 - `eureka/reflection.py`
-  - **Purpose**: builds LLM feedback prompt from best code + metrics.
+  - **Purpose**: builds LLM feedback prompt from best/Pareto elite code + metrics.
+  - When present, includes component means and training checkpoint snapshots so the
+    LLM can revise under-scaled terms (EUREKA Sec 3.3). Absent for float-only candidates.
 
 - `eureka/candidate_wrapper.py`
   - **Purpose**: executes candidate reward function in environment step loop.

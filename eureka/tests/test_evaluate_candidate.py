@@ -27,6 +27,7 @@ def _make_mock_env(n_episode_steps: int = 3):
             "n_overtakes": 1,
             "raw_reward": 0.5,
             "crashed": done and step_count["n"] == n_episode_steps,
+            "shaping_components": {},
         }
         return obs.copy(), 1.0, done, False, info
 
@@ -73,3 +74,6 @@ def test_evaluate_candidate_computes_averages(
     assert metrics["mean_speed"] == pytest.approx((21.0 + 22.0) / 2)
     assert metrics["mean_overtakes"] == pytest.approx(2.0)
     assert metrics["mean_raw_return"] == pytest.approx(1.0)
+    assert "component_means" in metrics
+    assert isinstance(metrics["component_means"], dict)
+    assert mock_load.call_args.kwargs.get("weights_only") is True

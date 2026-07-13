@@ -10,6 +10,7 @@ from eureka.sandbox import (
     load_shaping_reward_from_code,
     load_shaping_reward_from_module_path,
     module_path_to_source_path,
+    normalize_shaping_output,
     validate_candidate_ast,
 )
 
@@ -46,3 +47,28 @@ def test_validate_candidate_ast_requires_exactly_one_shaping_reward():
     passed, message = validate_candidate_ast(code)
     assert passed is False
     assert "shaping_reward" in message
+
+
+def test_normalize_shaping_output_float():
+    total, components = normalize_shaping_output(0.5)
+    assert total == pytest.approx(0.5)
+    assert components == {}
+
+
+def test_normalize_shaping_output_tuple_keeps_finite_components():
+    total, components = normalize_shaping_output(
+        (0.3, {"a": 0.1, "b": float("nan"), "c": "x", 1: 0.2})
+    )
+    assert total == pytest.approx(0.3)
+    assert components == {"a": 0.1}
+
+
+def test_normalize_shaping_output_rejects_malformed():
+    with pytest.raises(ValueError, match="length 2"):
+        normalize_shaping_output((0.1, 0.2, 0.3))
+    with pytest.raises(ValueError, match="dict"):
+        normalize_shaping_output((0.1, [0.1]))
+    with pytest.raises(ValueError, match="non-finite"):
+        normalize_shaping_output(float("inf"))
+    with pytest.raises(ValueError, match="float or"):
+        normalize_shaping_output("bad")

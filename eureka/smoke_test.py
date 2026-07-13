@@ -24,7 +24,6 @@ before writing LLM-generated reward code to disk - never trust generated
 code with a full training run until it's been exercised on real states.
 """
 
-import math
 import multiprocessing
 import sys
 
@@ -32,7 +31,7 @@ import gymnasium as gym
 import highway_env  # noqa: F401
 
 from config import ENV_CONFIG, ENV_ID
-from eureka.sandbox import exec_shaping_reward, validate_candidate_ast
+from eureka.sandbox import exec_shaping_reward, normalize_shaping_output, validate_candidate_ast
 from reward_wrapper import compute_overtakes
 
 MAX_ABS_VALUE = 5.0  # a shaping term returning something this large per step
@@ -98,7 +97,7 @@ def _probe_shaping_fn(fn, n_trials: int) -> tuple[bool, str]:
 
             for probe_idx, sample_info in enumerate(sample_infos):
                 try:
-                    value = fn(ego, road, sample_info)
+                    total, _components = normalize_shaping_output(fn(ego, road, sample_info))
                 except Exception as e:
                     passed = False
                     message = (
@@ -107,21 +106,12 @@ def _probe_shaping_fn(fn, n_trials: int) -> tuple[bool, str]:
                     )
                     break
 
-                if not isinstance(value, (int, float)) or not math.isfinite(value):
-                    passed = False
-                    message = (
-                        f"invalid return value on trial {i} "
-                        f"(probe {probe_idx}, n_overtakes={sample_info['n_overtakes']}): "
-                        f"{value!r}"
-                    )
-                    break
-
-                if abs(value) > MAX_ABS_VALUE:
+                if abs(total) > MAX_ABS_VALUE:
                     passed = False
                     message = (
                         f"return value out of range on trial {i} "
                         f"(probe {probe_idx}, n_overtakes={sample_info['n_overtakes']}): "
-                        f"{value}"
+                        f"{total}"
                     )
                     break
 

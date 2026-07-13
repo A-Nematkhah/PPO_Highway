@@ -5,6 +5,10 @@ Builds reward-reflection text from one legacy best candidate or multiple
 Pareto elites. Multi-elite prompts expose the real safety/speed/overtaking
 trade-off instead of pretending that one hand-weighted scalar is a universal
 definition of "best."
+
+When available, also surfaces per-component reward means and chronological
+training snapshots (EUREKA paper Sec 3.3 / Prompt 2) so the LLM can revise
+mis-scaled terms instead of guessing from scalar outcomes alone.
 """
 
 from eureka.eureka_config import N_EVAL_EPISODES
@@ -28,6 +32,41 @@ _TARGET_INSTRUCTIONS = {
         "preserve safety while making overtakes smoother and repeatable."
     ),
 }
+
+
+def _sample_checkpoint_values(values: list[float], max_points: int = 10) -> list[float]:
+    if len(values) <= max_points:
+        return list(values)
+    if max_points <= 1:
+        return [values[-1]]
+    indices = [
+        round(i * (len(values) - 1) / (max_points - 1))
+        for i in range(max_points)
+    ]
+    return [values[index] for index in indices]
+
+
+def _format_component_sections(candidate: dict, metrics: dict) -> str:
+    parts = []
+    component_means = metrics.get("component_means") or candidate.get("component_means") or {}
+    if component_means:
+        lines = ["Reward component means over this evaluation:"]
+        for key in sorted(component_means):
+            lines.append(f"- {key}: {float(component_means[key]):.4f}")
+        parts.append("\n".join(lines) + "\n")
+
+    history = candidate.get("component_history") or {}
+    if history:
+        lines = [
+            "Reward component values at checkpoints during training (chronological):"
+        ]
+        for key in sorted(history):
+            sampled = _sample_checkpoint_values(list(history[key]))
+            formatted = ", ".join(f"{float(v):.2f}" for v in sampled)
+            lines.append(f"- {key}: [{formatted}]")
+        parts.append("\n".join(lines) + "\n")
+
+    return "".join(parts)
 
 
 def build_reflection(elites: dict | list[dict] | None, target_role: str | None = None) -> str:
@@ -55,6 +94,7 @@ def build_reflection(elites: dict | list[dict] | None, target_role: str | None =
             if "fitness" in candidate
             else ""
         )
+        component_block = _format_component_sections(candidate, metrics)
         sections.append(
             f"Candidate {index} ({role}):\n"
             f"```python\n{candidate['code']}\n```\n"
@@ -62,7 +102,7 @@ def build_reflection(elites: dict | list[dict] | None, target_role: str | None =
             f"- crash_rate: {metrics['crash_rate']:.2%}\n"
             f"- mean_speed: {metrics['mean_speed']:.2f} m/s\n"
             f"- mean_overtakes: {metrics['mean_overtakes']:.2f} per episode\n"
-            f"{pareto}{legacy}"
+            f"{component_block}{pareto}{legacy}"
         )
 
     target = _TARGET_INSTRUCTIONS.get(

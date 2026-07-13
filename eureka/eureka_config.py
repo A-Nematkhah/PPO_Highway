@@ -71,6 +71,15 @@ FITNESS_WEIGHTS = {
 
 N_EVAL_EPISODES = 10       # deterministic evaluation episodes used to compute objectives
 
+# If True, generation 0 includes one extra candidate (in addition to the
+# K LLM-generated ones) seeded from the hand-written baseline reward in
+# eureka/human_seed.py. This candidate is smoke-tested, trained, and
+# evaluated identically to LLM candidates; its real metrics then flow
+# into the Pareto archive and generation-1 reflection context, following
+# the "EUREKA from Human Initialization" technique (Ma et al., ICLR 2024,
+# Sec 4.4). Adds exactly one extra train+eval run, only in generation 0.
+SEED_GENERATION_0_WITH_HUMAN_REWARD = True
+
 
 def candidate_base_seed(generation: int, k: int) -> int:
     """

@@ -8,9 +8,11 @@ goal here is comparing candidates against each other, not producing the
 best possible final policy.
 
 Logs compact training progress (steps, return, crash rate, entropy) so long
-candidate runs are not silent.
+candidate runs are not silent. Optional shaping_components from the candidate
+are accumulated into rolling-window snapshots for reward reflection.
 """
 
+import json
 import os
 import time
 
@@ -66,6 +68,12 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
     finished_speeds = []
     finished_overtakes = []
 
+    # Lazily keyed by component name once a non-empty shaping_components dict
+    # is observed. Empty for legacy bare-float candidates.
+    episode_component_sums: dict[str, np.ndarray] = {}
+    finished_components: dict[str, list[float]] = {}
+    component_history: dict[str, list[float]] = {}
+
     short_name = module_path.split(".")[-1]
     progress = TrainProgressTable(short_name, n_updates)
     logger.info(
@@ -115,12 +123,29 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
             )
             episode_steps += 1
 
+            for i, info in enumerate(infos):
+                components = info.get("shaping_components") or {}
+                if not components:
+                    continue
+                for key, value in components.items():
+                    if key not in episode_component_sums:
+                        episode_component_sums[key] = np.zeros(
+                            EUREKA_N_ENVS, dtype=np.float64
+                        )
+                        finished_components.setdefault(key, [])
+                        component_history.setdefault(key, [])
+                    episode_component_sums[key][i] += float(value)
+
             for i, d in enumerate(next_done):
                 if d:
                     finished_returns.append(episode_returns[i])
                     finished_crashed.append(bool(infos[i].get("crashed", False)))
                     finished_speeds.append(episode_speed_sum[i] / max(episode_steps[i], 1))
                     finished_overtakes.append(episode_overtakes[i])
+                    steps_i = max(episode_steps[i], 1)
+                    for key, sums in episode_component_sums.items():
+                        finished_components[key].append(float(sums[i] / steps_i))
+                        sums[i] = 0.0
                     episode_returns[i] = 0.0
                     episode_speed_sum[i] = 0.0
                     episode_overtakes[i] = 0
@@ -154,6 +179,14 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
             mean_speed = float(np.mean(recent_speeds)) if recent_speeds else float("nan")
             mean_overtakes = float(np.mean(recent_overtakes)) if recent_overtakes else float("nan")
 
+            component_snapshots: dict[str, float] = {}
+            for key, values in finished_components.items():
+                recent = values[-ROLLING_WINDOW:]
+                if recent:
+                    mean_val = float(np.mean(recent))
+                    component_snapshots[key] = mean_val
+                    component_history[key].append(mean_val)
+
             progress.add_row(
                 update=update,
                 global_step=global_step,
@@ -175,6 +208,7 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
                     "crash_rate_pct": crash_rate,
                     "mean_speed": mean_speed,
                     "mean_overtakes": mean_overtakes,
+                    "component_snapshots": component_snapshots,
                     "entropy": stats["entropy"],
                     "approx_kl": stats["approx_kl"],
                 },
@@ -183,9 +217,15 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
     env.close()
 
     module_name = module_path.split(".")[-1]
-    checkpoint_path = os.path.join("eureka", "checkpoints", f"{module_name}.pt")
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    checkpoint_dir = os.path.join("eureka", "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"{module_name}.pt")
     torch.save(model.state_dict(), checkpoint_path)
+
+    if component_history:
+        components_path = os.path.join(checkpoint_dir, f"{module_name}_components.json")
+        with open(components_path, "w", encoding="utf-8") as f:
+            json.dump({"component_history": component_history}, f)
 
     elapsed = time.time() - start_time
     logger.info(

@@ -3,9 +3,10 @@ candidate_wrapper.py
 
 CandidateRewardWrapper: same shape as reward_wrapper.RewardShapingWrapper,
 but instead of a hardcoded TTC penalty + overtake bonus, it applies an
-arbitrary shaping_fn(ego, road, info) -> float supplied by the caller. This
-is what lets eureka/loop.py plug in a different, LLM-generated reward
-function per candidate without touching the wrapper class itself.
+arbitrary shaping_fn(ego, road, info) -> float | (float, dict) supplied by
+the caller. This is what lets eureka/loop.py plug in a different,
+LLM-generated reward function per candidate without touching the wrapper
+class itself.
 
 n_overtakes is still computed deterministically here (reusing
 reward_wrapper.compute_overtakes) and exposed via info, for two reasons:
@@ -19,6 +20,10 @@ A candidate that raises an exception, times out, or returns a non-finite/invalid
 value degrades to a zero shaping bonus for that step rather than crashing
 training - a bad candidate should train into a "does nothing extra" policy
 and simply score poorly, not take down the whole run.
+
+Optional reward_components (when the candidate returns a 2-tuple) are stored
+in info["shaping_components"] for logging/reflection only — they never alter
+the scalar reward used for RL updates.
 """
 
 import gymnasium as gym
@@ -55,9 +60,12 @@ class CandidateRewardWrapper(gym.Wrapper):
             "n_overtakes": n_overtakes,
         }
 
-        shaping_value = call_shaping_fn(self.shaping_fn, ego, road, candidate_info)
+        shaping_value, shaping_components = call_shaping_fn(
+            self.shaping_fn, ego, road, candidate_info
+        )
 
         shaped_reward = reward + shaping_value
         info["shaping_value"] = shaping_value
+        info["shaping_components"] = shaping_components
 
         return obs, shaped_reward, terminated, truncated, info

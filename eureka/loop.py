@@ -35,6 +35,7 @@ from eureka.eureka_config import (
     OBJECTIVE_SPECS,
     PARETO_ARCHIVE_SIZE,
     REFLECTION_ELITES,
+    SEED_GENERATION_0_WITH_HUMAN_REWARD,
     TRAIN_STEPS_PER_CANDIDATE,
     candidate_base_seed,
 )
@@ -197,6 +198,14 @@ def main():
             )
             llm_ctx["n_received"] = len(candidates_code)
 
+        # Extra generation-0 slot: human-authored baseline (EUREKA Sec 4.4).
+        # Not counted against K_CANDIDATES; only prepended once in generation 0.
+        human_seed_index = None
+        if generation == 0 and SEED_GENERATION_0_WITH_HUMAN_REWARD:
+            from eureka.human_seed import HUMAN_SEED_CODE
+            candidates_code = [HUMAN_SEED_CODE] + list(candidates_code)
+            human_seed_index = 0
+
         if not candidates_code:
             logger.warning(
                 "no candidates returned from LLM",
@@ -222,10 +231,16 @@ def main():
         generation_results = []
 
         for k, code in enumerate(candidates_code):
+            source = "human_seed" if k == human_seed_index else "llm"
             cand_start = time.perf_counter()
             logger.info(
                 "candidate started",
-                extra={"event": "candidate_start", "generation": generation, "candidate": k},
+                extra={
+                    "event": "candidate_start",
+                    "generation": generation,
+                    "candidate": k,
+                    "source": source,
+                },
             )
 
             with telemetry.timed("smoke_test", generation=generation, candidate=k) as smoke_ctx:
@@ -264,6 +279,7 @@ def main():
             )
 
             checkpoint_path = None
+            component_history = None
             try:
                 with telemetry.timed("train", generation=generation, candidate=k, module_path=module_path) as train_ctx:
                     train_ctx["total_timesteps"] = TRAIN_STEPS_PER_CANDIDATE
@@ -273,6 +289,15 @@ def main():
                         seed=candidate_base_seed(generation, k),
                     )
                     train_ctx["checkpoint"] = checkpoint_path
+                components_sidecar = os.path.join(
+                    "eureka", "checkpoints", f"{module_name}_components.json"
+                )
+                if os.path.isfile(components_sidecar):
+                    with open(components_sidecar, encoding="utf-8") as f:
+                        sidecar = json.load(f)
+                    history = sidecar.get("component_history") or {}
+                    if history:
+                        component_history = history
             except RuntimeError as e:
                 logger.warning(
                     "candidate rejected during training",
@@ -316,6 +341,7 @@ def main():
                     "event": "candidate_complete",
                     "generation": generation,
                     "candidate": k,
+                    "source": source,
                     "legacy_fitness": fitness,
                     "duration_s": cand_duration,
                     **metrics,
@@ -325,6 +351,7 @@ def main():
                 "candidate_complete",
                 generation=generation,
                 candidate=k,
+                source=source,
                 module_path=module_path,
                 legacy_fitness=fitness,
                 duration_s=cand_duration,
@@ -341,7 +368,10 @@ def main():
                 "timing_s": {"total": cand_duration},
                 "generation": generation,
                 "candidate_index": k,
+                "source": source,
             }
+            if component_history:
+                result["component_history"] = component_history
             result["candidate_id"] = candidate_id(result)
             generation_results.append(result)
 

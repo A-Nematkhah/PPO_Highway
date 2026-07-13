@@ -58,5 +58,21 @@ def test_candidate_wrapper_zero_on_bad_return():
     wrapper = CandidateRewardWrapper(env, lambda ego, road, info: float("nan"))
     _, reward, _, _, info = wrapper.step(0)
     assert info["shaping_value"] == 0.0
+    assert info["shaping_components"] == {}
     assert reward == pytest.approx(1.0)
+    wrapper.close()
+
+
+def test_candidate_wrapper_propagates_components_without_double_counting():
+    ego = _FakeVehicle(10.0)
+    other = _FakeVehicle(12.0)
+    env = _MinimalEnv(ego, other)
+    wrapper = CandidateRewardWrapper(
+        env, lambda ego, road, info: (0.5, {"ttc": 0.3, "overtake": 0.2})
+    )
+    _, reward, _, _, info = wrapper.step(0)
+
+    assert info["shaping_value"] == pytest.approx(0.5)
+    assert info["shaping_components"] == {"ttc": 0.3, "overtake": 0.2}
+    assert reward == pytest.approx(1.5)  # raw 1.0 + total 0.5 only
     wrapper.close()

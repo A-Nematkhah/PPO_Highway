@@ -17,15 +17,50 @@ def _slow_fn(ego, road, info):
 
 
 def test_call_shaping_fn_returns_value_when_fast():
-    assert call_shaping_fn(_fast_fn, None, None, {"n_overtakes": 3}, timeout_s=0.5) == pytest.approx(0.3)
+    value, components = call_shaping_fn(
+        _fast_fn, None, None, {"n_overtakes": 3}, timeout_s=0.5
+    )
+    assert value == pytest.approx(0.3)
+    assert components == {}
 
 
 def test_call_shaping_fn_returns_zero_on_timeout():
-    assert call_shaping_fn(_slow_fn, None, None, {}, timeout_s=0.05) == 0.0
+    value, components = call_shaping_fn(_slow_fn, None, None, {}, timeout_s=0.05)
+    assert value == 0.0
+    assert components == {}
 
 
 def test_call_shaping_fn_returns_zero_on_exception():
     def _boom(ego, road, info):
         raise RuntimeError("boom")
 
-    assert call_shaping_fn(_boom, None, None, {}, timeout_s=0.5) == 0.0
+    value, components = call_shaping_fn(_boom, None, None, {}, timeout_s=0.5)
+    assert value == 0.0
+    assert components == {}
+
+
+def test_call_shaping_fn_propagates_component_dict():
+    def _with_components(ego, road, info):
+        return 0.3, {"a": 0.1, "b": 0.2}
+
+    value, components = call_shaping_fn(
+        _with_components, None, None, {}, timeout_s=0.5
+    )
+    assert value == pytest.approx(0.3)
+    assert components == {"a": 0.1, "b": 0.2}
+
+
+def test_call_shaping_fn_degrades_malformed_tuple():
+    def _bad_arity(ego, road, info):
+        return (0.1, 0.2, 0.3)
+
+    value, components = call_shaping_fn(_bad_arity, None, None, {}, timeout_s=0.5)
+    assert value == 0.0
+    assert components == {}
+
+    def _bad_components(ego, road, info):
+        return (0.1, [0.05, 0.05])
+
+    value, components = call_shaping_fn(_bad_components, None, None, {}, timeout_s=0.5)
+    assert value == 0.0
+    assert components == {}

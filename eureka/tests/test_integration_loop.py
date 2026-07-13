@@ -25,6 +25,7 @@ def test_loop_end_to_end_with_mocked_llm(tmp_path, monkeypatch):
     monkeypatch.setattr("eureka.loop.K_CANDIDATES", 1)
     monkeypatch.setattr("eureka.loop.TRAIN_STEPS_PER_CANDIDATE", 512)
     monkeypatch.setattr("eureka.loop.N_EVAL_EPISODES", 2)
+    monkeypatch.setattr("eureka.loop.SEED_GENERATION_0_WITH_HUMAN_REWARD", False)
     monkeypatch.setattr("eureka.loop.LOG_PATH", "eureka/eureka_log.json")
     monkeypatch.setattr(
         "eureka.loop.generate_candidates",
@@ -100,6 +101,7 @@ def test_pareto_mode_keeps_tradeoffs_and_uses_unweighted_representative(
     monkeypatch.setattr("eureka.loop.K_CANDIDATES", 2)
     monkeypatch.setattr("eureka.loop.MULTI_OBJECTIVE_MODE", "pareto")
     monkeypatch.setattr("eureka.loop.CONFIRMATION_SEEDS", ())
+    monkeypatch.setattr("eureka.loop.SEED_GENERATION_0_WITH_HUMAN_REWARD", False)
     monkeypatch.setattr("eureka.loop.LOG_PATH", "eureka/eureka_log.json")
     monkeypatch.setattr(
         "eureka.loop.generate_candidates",
@@ -176,6 +178,7 @@ def test_shadow_mode_preserves_legacy_scalar_reflection_parent(tmp_path, monkeyp
     monkeypatch.setattr("eureka.loop.K_CANDIDATES", 2)
     monkeypatch.setattr("eureka.loop.MULTI_OBJECTIVE_MODE", "shadow")
     monkeypatch.setattr("eureka.loop.CONFIRMATION_SEEDS", ())
+    monkeypatch.setattr("eureka.loop.SEED_GENERATION_0_WITH_HUMAN_REWARD", False)
     monkeypatch.setattr("eureka.loop.LOG_PATH", "eureka/eureka_log.json")
     monkeypatch.setattr("eureka.loop.generate_candidates", generate)
     monkeypatch.setattr("eureka.loop.smoke_test", lambda code: (True, "ok"))
