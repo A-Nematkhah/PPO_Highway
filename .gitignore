@@ -1,0 +1,14 @@
+groq_keys.json
+checkpoints/
+eureka/checkpoints/
+eureka/candidates/gen*.py
+eureka/eureka_log.json
+eureka/eureka_metrics.jsonl
+*.pt
+learning_curve.png
+crash_rate.png
+speed.png
+__pycache__/
+*.pyc
+.coverage
+.pytest_cache/

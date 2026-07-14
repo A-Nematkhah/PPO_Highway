@@ -1,0 +1,12 @@
+[run]
+source = eureka
+omit =
+    eureka/loop.py
+    eureka/train_candidate.py
+    eureka/smoke_test.py
+    eureka/env_factory.py
+    eureka/tests/*
+
+[report]
+fail_under = 80
+show_missing = True
