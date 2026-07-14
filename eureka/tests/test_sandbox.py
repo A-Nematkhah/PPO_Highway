@@ -72,3 +72,75 @@ def test_normalize_shaping_output_rejects_malformed():
         normalize_shaping_output(float("inf"))
     with pytest.raises(ValueError, match="float or"):
         normalize_shaping_output("bad")
+
+
+# --- ego/road/info mutation guard (P1 fix) -------------------------------
+
+
+def test_validate_candidate_ast_rejects_ego_attribute_assignment():
+    code = (
+        "def shaping_reward(ego, road, info):\n"
+        "    ego.speed = 100.0\n"
+        "    return 0.0\n"
+    )
+    passed, message = validate_candidate_ast(code)
+    assert passed is False
+    assert "ego" in message
+
+
+def test_validate_candidate_ast_rejects_ego_augassign():
+    code = (
+        "def shaping_reward(ego, road, info):\n"
+        "    ego.speed += 1.0\n"
+        "    return 0.0\n"
+    )
+    passed, message = validate_candidate_ast(code)
+    assert passed is False
+    assert "ego" in message
+
+
+def test_validate_candidate_ast_rejects_road_subscript_assignment():
+    code = (
+        "def shaping_reward(ego, road, info):\n"
+        "    road.vehicles[0] = None\n"
+        "    return 0.0\n"
+    )
+    passed, message = validate_candidate_ast(code)
+    assert passed is False
+    assert "road" in message
+
+
+def test_validate_candidate_ast_rejects_info_subscript_assignment():
+    code = (
+        "def shaping_reward(ego, road, info):\n"
+        "    info['crashed'] = False\n"
+        "    return 0.0\n"
+    )
+    passed, message = validate_candidate_ast(code)
+    assert passed is False
+    assert "info" in message
+
+
+def test_validate_candidate_ast_allows_local_variable_and_dict_mutation():
+    """
+    The mutation guard is scoped to the ego/road/info parameters only -
+    ordinary local state assembly (which the LLM prompt explicitly asks
+    for, e.g. named temperature/scale variables and a components dict)
+    must keep working.
+    """
+    code = (
+        "def shaping_reward(ego, road, info):\n"
+        "    ttc_temp = 5.0\n"
+        "    components = {}\n"
+        "    components['a'] = 0.1\n"
+        "    total = 0.0\n"
+        "    total += components['a'] * ttc_temp\n"
+        "    return total, components\n"
+    )
+    passed, message = validate_candidate_ast(code)
+    assert passed is True, message
+
+    fn = load_shaping_reward_from_code(code)
+    total, components = fn(None, None, {})
+    assert total == pytest.approx(0.5)
+    assert components == {"a": 0.1}

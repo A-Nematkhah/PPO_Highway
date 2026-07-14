@@ -75,6 +75,36 @@ _REDTEAM_PAYLOADS = [
         "def shaping_reward(ego, road, info):\n"
         "    def inner():\n        return 1\n    return inner()\n",
     ),
+    (
+        "ego_attribute_mutation",
+        "def shaping_reward(ego, road, info):\n"
+        "    ego.speed = 999.0\n"
+        "    return 0.0\n",
+    ),
+    (
+        "ego_attribute_mutation_nested",
+        "def shaping_reward(ego, road, info):\n"
+        "    ego.position[0] = 0.0\n"
+        "    return 0.0\n",
+    ),
+    (
+        "road_subscript_mutation",
+        "def shaping_reward(ego, road, info):\n"
+        "    road.vehicles[0] = None\n"
+        "    return 0.0\n",
+    ),
+    (
+        "road_attribute_delete",
+        "def shaping_reward(ego, road, info):\n"
+        "    del road.vehicles\n"
+        "    return 0.0\n",
+    ),
+    (
+        "info_subscript_mutation",
+        "def shaping_reward(ego, road, info):\n"
+        "    info['crashed'] = False\n"
+        "    return 0.0\n",
+    ),
 ]
 
 

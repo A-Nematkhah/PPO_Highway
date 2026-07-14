@@ -17,6 +17,14 @@ Security model (Phase 1 hardening):
       New Python syntax features default to REJECT until allowlisted.
     - Restricted exec namespace: same tiny builtin set + injected `math`.
     - Training-time load re-validates AST from disk (tamper detection).
+    - Assignment/deletion into the ego/road/info parameters themselves is
+      rejected (see _WhitelistASTVisitor.visit_Attribute /
+      .visit_Subscript below) - candidate code may only READ from these
+      objects, never mutate them. `ego` and `road` in particular are
+      references into the LIVE highway-env simulation state (not copies),
+      so `ego.speed = 999.0` or `road.vehicles[0] = None` would otherwise
+      let a candidate corrupt the actual running episode instead of just
+      computing a shaping value from it.
 
 Remaining risk (documented, Phase 3 target):
     - In-process exec() is not a cryptographic sandbox; a determined attacker
@@ -24,6 +32,14 @@ Remaining risk (documented, Phase 3 target):
     - No OS-level container (nsjail/firejail) yet — worker still shares the
       parent user's filesystem/network UID.
     - Declarative Reward DSL (no exec) is the long-term zero-exec path.
+    - The ego/road/info mutation guard is a name-based check on the literal
+      parameter identifiers, not full alias/data-flow analysis. Code that
+      first aliases a live object through a local variable and mutates it
+      via that alias (e.g. `for v in road.vehicles: v.speed = 0`) is NOT
+      caught by this guard, since `v` is not itself one of the function's
+      formal parameters. Closing that gap fully requires either real
+      data-flow tracking or the Phase 3 no-exec DSL; until then this is a
+      known, intentionally-scoped limitation (see docs/SECURITY.md).
 """
 
 from __future__ import annotations
@@ -106,6 +122,23 @@ _ALLOWED_NODE_TYPES = frozenset({
 })
 
 
+def _assignment_root_name(node: ast.AST) -> str | None:
+    """
+    Walk an Attribute/Subscript store/del target down to its innermost
+    root expression (e.g. `road.vehicles[0].speed` -> `road`).
+
+    Returns the root's identifier if the root is a plain `ast.Name`, else
+    None (e.g. the root is a call result like `foo().x = 1` - not caught
+    by this specific guard, but still constrained by the restricted-call
+    allowlist elsewhere).
+    """
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
 class _WhitelistASTVisitor(ast.NodeVisitor):
     """
     Allowlist gate: reject any AST construct not explicitly permitted.
@@ -115,6 +148,7 @@ class _WhitelistASTVisitor(ast.NodeVisitor):
     def __init__(self):
         self.error: str | None = None
         self._function_depth = 0
+        self._param_names: set[str] = set()
 
     def _reject(self, message: str) -> None:
         if self.error is None:
@@ -148,6 +182,10 @@ class _WhitelistASTVisitor(ast.NodeVisitor):
             self._reject(f"only `shaping_reward` is allowed, got {node.name!r}")
             self._function_depth -= 1
             return
+        # Remember the formal parameter names (normally ego/road/info) so
+        # visit_Attribute / visit_Subscript can tell "assignment into an
+        # argument object" apart from "assignment into a local variable".
+        self._param_names = {arg.arg for arg in node.args.args}
         self.generic_visit(node)
         self._function_depth -= 1
 
@@ -155,6 +193,27 @@ class _WhitelistASTVisitor(ast.NodeVisitor):
         if node.attr.startswith("__"):
             self._reject(f"dunder attribute access is not allowed: {node.attr!r}")
             return
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = _assignment_root_name(node)
+            if root in self._param_names:
+                self._reject(
+                    f"assignment to {root}.{node.attr} is not allowed - "
+                    "shaping_reward must only read from its ego/road/info "
+                    "arguments, never mutate them"
+                )
+                return
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node):
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = _assignment_root_name(node)
+            if root in self._param_names:
+                self._reject(
+                    f"subscript assignment to {root}[...] is not allowed - "
+                    "shaping_reward must only read from its ego/road/info "
+                    "arguments, never mutate them"
+                )
+                return
         self.generic_visit(node)
 
     def visit_Call(self, node):

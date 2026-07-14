@@ -152,7 +152,17 @@ class SyncVectorEnv:
             obs:     (n, *obs_shape)
             rewards: (n,)
             dones:   (n,)  -- True if that env's episode ended this step
-            infos:   list[dict] of length n
+                             (either terminated OR truncated)
+            infos:   list[dict] of length n. When an episode ends, the info
+                     dict for that env additionally contains
+                     "terminal_observation" (the true final observation,
+                     before auto-reset) and "TimeLimit.truncated" (True
+                     only when the episode ended via the time limit rather
+                     than a genuine terminal state such as a collision) -
+                     the standard Gymnasium/SB3 convention. Callers that
+                     want correct value bootstrapping across a time-limit
+                     cutoff (rather than treating it as an absorbing
+                     terminal state) should use these two fields together.
         """
         obs_list, reward_list, done_list, info_list = [], [], [], []
 
@@ -164,6 +174,7 @@ class SyncVectorEnv:
                 # keep the true terminal observation available for anyone who
                 # wants to bootstrap value estimates correctly, then reset
                 info["terminal_observation"] = obs
+                info["TimeLimit.truncated"] = bool(truncated and not terminated)
                 obs, _ = env.reset()
 
             obs_list.append(obs)
@@ -206,6 +217,7 @@ def _worker(remote, parent_remote, env_fn):
                 done = terminated or truncated
                 if done:
                     info["terminal_observation"] = obs
+                    info["TimeLimit.truncated"] = bool(truncated and not terminated)
                     obs, _ = env.reset()
                 remote.send(("ok", (obs, reward, done, info)))
 
@@ -237,6 +249,9 @@ class AsyncVectorEnv:
     API-compatible with SyncVectorEnv (reset / step / close), so it's a
     drop-in replacement wherever make_vec_env(..., parallel=True) is used
     (e.g. eureka candidate training via env_factory).
+
+    See SyncVectorEnv.step() docstring for the "TimeLimit.truncated" /
+    "terminal_observation" info-dict convention shared by both classes.
     """
 
     def __init__(self, env_fns):
@@ -255,12 +270,22 @@ class AsyncVectorEnv:
             self.processes.append(process)
             work_remote.close()
 
-        for worker_idx, remote in enumerate(self.remotes):
-            remote.send(("spaces", None))
-            context = f"worker {worker_idx} initializing ({self._env_labels[worker_idx]})"
-            spaces = _recv_with_timeout(remote, WORKER_INIT_TIMEOUT_S, context)
-            if worker_idx == 0:
-                self.observation_space, self.action_space = spaces
+        try:
+            for worker_idx, remote in enumerate(self.remotes):
+                remote.send(("spaces", None))
+                context = f"worker {worker_idx} initializing ({self._env_labels[worker_idx]})"
+                spaces = _recv_with_timeout(remote, WORKER_INIT_TIMEOUT_S, context)
+                if worker_idx == 0:
+                    self.observation_space, self.action_space = spaces
+        except Exception:
+            # At least one worker failed (or hung) during init. Previously
+            # this exception propagated straight out of __init__, leaving
+            # any already-started sibling worker processes running in the
+            # background indefinitely (never joined, never terminated) -
+            # a process/pipe leak on every rejected candidate whose env
+            # factory raises. Clean up before re-raising.
+            self.close()
+            raise
 
     def reset(self):
         for worker_idx, remote in enumerate(self.remotes):
@@ -288,10 +313,36 @@ class AsyncVectorEnv:
         )
 
     def close(self):
+        """
+        Best-effort shutdown of every worker. Must never raise or hang,
+        even if some workers already crashed / hung / broke their pipe -
+        this is the cleanup path called from exception handlers (including
+        __init__ failure and train_candidate.py's finally block), so a
+        second failure here must not mask the original error or leave
+        processes running.
+        """
         for remote in self.remotes:
-            remote.send(("close", None))
+            try:
+                remote.send(("close", None))
+            except (BrokenPipeError, EOFError, OSError):
+                # worker already dead / pipe already broken - nothing to signal
+                pass
+
         for process in self.processes:
-            process.join()
+            process.join(timeout=WORKER_OP_TIMEOUT_S)
+            if process.is_alive():
+                # Worker did not exit cleanly (e.g. stuck in a hung
+                # shaping_reward call, or never got far enough to service
+                # "close"). Do not let close() hang forever or leak an
+                # orphaned process - terminate it directly.
+                process.terminate()
+                process.join(timeout=5.0)
+
+        for remote in self.remotes:
+            try:
+                remote.close()
+            except OSError:
+                pass
 
 
 def make_vec_env(n_envs: int = N_ENVS, seed: int = SEED, parallel: bool = True):
@@ -306,7 +357,7 @@ def make_vec_env(n_envs: int = N_ENVS, seed: int = SEED, parallel: bool = True):
 
 
 if __name__ == "__main__":
-    # quick inspection script - run this to see obs/action space before
+    # quick inspection script - run this to see obs/action space shapes before
     # designing the network input size
     env = gym.make(ENV_ID)
     env.unwrapped.configure(ENV_CONFIG)

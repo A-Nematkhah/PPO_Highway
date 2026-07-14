@@ -41,7 +41,13 @@ def test_call_shaping_fn_returns_value_when_fast():
 
 def test_call_shaping_fn_returns_zero_on_timeout(caplog):
     with caplog.at_level(logging.WARNING, logger="eureka.shaping_call"):
-        value, components = call_shaping_fn(_slow_fn, None, None, {}, timeout_s=0.05)
+        sc.logger.addHandler(caplog.handler)
+        try:
+            value, components = call_shaping_fn(
+                _slow_fn, None, None, {}, timeout_s=0.05
+            )
+        finally:
+            sc.logger.removeHandler(caplog.handler)
     assert value == 0.0
     assert components == {}
     timeout_logs = [
@@ -92,11 +98,15 @@ def test_executor_replaced_after_leak_saturation(monkeypatch, caplog):
     monkeypatch.setattr(sc, "_max_workers", 2)
 
     with caplog.at_level(logging.WARNING, logger="eureka.shaping_call"):
-        call_shaping_fn(_hang_fn, None, None, {}, timeout_s=0.01)
-        call_shaping_fn(_hang_fn, None, None, {}, timeout_s=0.01)
-        value, components = call_shaping_fn(
-            _fast_fn, None, None, {"n_overtakes": 4}, timeout_s=0.5
-        )
+        sc.logger.addHandler(caplog.handler)
+        try:
+            call_shaping_fn(_hang_fn, None, None, {}, timeout_s=0.01)
+            call_shaping_fn(_hang_fn, None, None, {}, timeout_s=0.01)
+            value, components = call_shaping_fn(
+                _fast_fn, None, None, {"n_overtakes": 4}, timeout_s=0.5
+            )
+        finally:
+            sc.logger.removeHandler(caplog.handler)
 
     assert value == pytest.approx(0.4)
     assert components == {}

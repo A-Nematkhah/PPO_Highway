@@ -93,8 +93,22 @@ def candidate_base_seed(generation: int, k: int) -> int:
     Base seed for one candidate's vector env. Each candidate in a generation
     owns a disjoint block of EUREKA_N_ENVS consecutive seeds so sibling
     candidates never share RNG state across their parallel sub-envs.
+
+    IMPORTANT: the stride reserves K_CANDIDATES + 1 slots per generation
+    (not just K_CANDIDATES). Generation 0 can train K_CANDIDATES + 1
+    candidates when SEED_GENERATION_0_WITH_HUMAN_REWARD is True (the human
+    seed is prepended at index 0, LLM candidates occupy k=1..K_CANDIDATES).
+    With a stride of exactly K_CANDIDATES * EUREKA_N_ENVS, generation 0's
+    last candidate (k == K_CANDIDATES) and generation 1's first candidate
+    (k == 0) previously computed the SAME base seed and therefore trained
+    on identical stochastic rollouts - a silent RNG collision that
+    confounded both within-generation ranking and cross-generation
+    reflection. Reserving one extra slot per generation fixes this
+    unconditionally (regardless of whether the human seed is enabled),
+    at the cost of one unused seed block per generation after gen 0.
     """
-    return generation * K_CANDIDATES * EUREKA_N_ENVS + k * EUREKA_N_ENVS
+    slots_per_generation = K_CANDIDATES + 1
+    return generation * slots_per_generation * EUREKA_N_ENVS + k * EUREKA_N_ENVS
 
 
 # --- LLM ---

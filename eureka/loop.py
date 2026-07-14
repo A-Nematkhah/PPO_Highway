@@ -155,8 +155,30 @@ def _confirm_archive(
 
         item = dict(candidate)
         item["screening_metrics"] = candidate["metrics"]
+        item["screening_checkpoint"] = candidate["checkpoint"]
         item["confirmation_runs"] = confirmation_records
         item["metrics"] = _aggregate_metrics(runs)
+
+        # The candidate's `fitness`/`legacy_fitness` and `checkpoint` fields
+        # previously stayed frozen at their screening-run values even
+        # though `metrics` above was just replaced with the aggregate
+        # across confirmation seeds. That left every downstream consumer
+        # (final archive, run_complete telemetry, reflection prompts for
+        # any later generation) reading metrics that didn't match the
+        # fitness score or the checkpoint file sitting next to them.
+        # Recompute both so they describe the same run.
+        item["fitness"] = compute_fitness(item["metrics"], FITNESS_WEIGHTS)
+        item["legacy_fitness"] = item["fitness"]
+        if confirmation_records:
+            # `checkpoint` becomes ambiguous once `metrics` is an aggregate
+            # over multiple seeds - no single checkpoint file *is* the
+            # aggregate. We keep the most recently confirmed seed's
+            # checkpoint as the representative artifact (consistent with
+            # it being the last one evaluated into `runs`), and preserve
+            # the original screening checkpoint separately above for
+            # anyone who specifically wants the pre-confirmation policy.
+            item["checkpoint"] = confirmation_records[-1]["checkpoint"]
+
         confirmed.append(item)
 
     return update_archive([], confirmed, OBJECTIVE_SPECS, PARETO_ARCHIVE_SIZE)
@@ -293,11 +315,32 @@ def main():
                     "eureka", "checkpoints", f"{module_name}_components.json"
                 )
                 if os.path.isfile(components_sidecar):
-                    with open(components_sidecar, encoding="utf-8") as f:
-                        sidecar = json.load(f)
-                    history = sidecar.get("component_history") or {}
-                    if history:
-                        component_history = history
+                    try:
+                        with open(components_sidecar, encoding="utf-8") as f:
+                            sidecar = json.load(f)
+                        history = sidecar.get("component_history") or {}
+                        if history:
+                            component_history = history
+                    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+                        # A malformed/corrupt sidecar (partial write from a
+                        # prior crashed run, disk issue, etc.) previously
+                        # propagated straight out of json.load and aborted
+                        # the ENTIRE multi-hour search, taking down every
+                        # other candidate and generation with it - all for
+                        # a piece of purely diagnostic reflection data.
+                        # Component history is a nice-to-have for LLM
+                        # feedback, not required for training/eval/ranking;
+                        # degrade gracefully and keep the run going.
+                        logger.warning(
+                            "component sidecar unreadable, continuing without component history",
+                            extra={
+                                "event": "component_sidecar_read_failed",
+                                "generation": generation,
+                                "candidate": k,
+                                "path": components_sidecar,
+                                "reason": str(e),
+                            },
+                        )
             except RuntimeError as e:
                 logger.warning(
                     "candidate rejected during training",
