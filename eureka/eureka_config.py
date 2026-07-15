@@ -4,18 +4,69 @@ eureka_config.py
 Hyperparameters for the Phase 4 evolutionary reward design loop
 (eureka/loop.py). Kept separate from the main project's config.py since
 these control the search process itself, not any single training run.
+
+--------------------------------------------------------------------------
+Hardware-scaling knobs (env-var overridable)
+--------------------------------------------------------------------------
+Everything below that says "env-var overridable" reads an environment
+variable first and falls back to a default sized for a modest single
+machine. This lets the SAME committed defaults stay safe/fast for CI and
+a laptop, while a bigger box (e.g. many-vCPU / no-GPU servers) can opt in
+per-run without editing this file:
+
+    # Linux/macOS
+    export EUREKA_MAX_CONCURRENT_CANDIDATES=6
+    export EUREKA_N_ENVS=16
+    python -m eureka.loop
+
+    # Windows PowerShell
+    $env:EUREKA_MAX_CONCURRENT_CANDIDATES = "6"
+    $env:EUREKA_N_ENVS = "16"
+    python -m eureka.loop
+
+MAX_CONCURRENT_CANDIDATES defaults to 1 (fully sequential) on purpose:
+the unit/integration test suite monkeypatches
+eureka.loop.train_candidate / evaluate_candidate / smoke_test directly,
+which only works when loop.py calls those symbols in-process. The
+parallel path (MAX_CONCURRENT_CANDIDATES > 1) dispatches real work to
+separate OS processes via ProcessPoolExecutor, which re-imports
+eureka.train_candidate fresh in each worker and therefore does NOT see
+monkeypatches applied in the parent test process. Keeping the default at
+1 means `pytest` always exercises the sequential (patchable) code path,
+and nothing breaks until a human explicitly opts into parallel execution
+for a real, unmocked training run.
 """
+
+import os
 
 # --- evolutionary search ---
 N_GENERATIONS = 3          # how many rounds of candidate generation + training
-K_CANDIDATES = 4           # how many reward candidates the LLM proposes per generation
-                            # (EUREKA's paper uses 16 - kept small here for feasibility
-                            # on a single machine; increase if you have time/compute)
+K_CANDIDATES = int(os.environ.get("EUREKA_K_CANDIDATES", "8"))
+                            # how many reward candidates the LLM proposes per generation.
+                            # Bumped from 4 -> 8: with only 4 children per generation,
+                            # a 3-generation run empirically failed to ever improve on
+                            # the generation-0 archive (see run log analysis). A wider
+                            # generation gives Pareto selection more material to work
+                            # with per round.
 
 # --- per-candidate training budget ---
-TRAIN_STEPS_PER_CANDIDATE = 50_000
-EUREKA_N_ENVS = 4          # fewer parallel envs than main training (config.N_ENVS=6),
-                            # since we're running many short trainings back-to-back
+TRAIN_STEPS_PER_CANDIDATE = int(os.environ.get("EUREKA_TRAIN_STEPS_PER_CANDIDATE", "150000"))
+                            # Raised from 50_000 -> 150_000. Confirmation runs on a
+                            # many-vCPU box showed the SAME unmodified candidate
+                            # swinging from mean_overtakes=1.53 -> 0.80 -> 1.53 and
+                            # crash_rate=0.17 -> 0.27 purely from changing the training
+                            # seed. That's measurement noise, not signal, and it was
+                            # large enough to make epsilon-dominance decisions
+                            # essentially arbitrary. More steps per candidate reduces
+                            # this variance; affordable now that concurrent candidate
+                            # training (below) no longer makes this a purely serial
+                            # wall-clock cost.
+EUREKA_N_ENVS = int(os.environ.get("EUREKA_N_ENVS", "16"))
+                            # Raised from 4 -> 16. Bottleneck for a tiny 256x256 MLP
+                            # on CPU is environment-stepping throughput, not matrix
+                            # multiplication - more parallel envs per candidate directly
+                            # buys more rollout throughput. Tune down on smaller
+                            # machines via the EUREKA_N_ENVS env var.
 
 # Per-step wall-clock cap on shaping_reward() during training/eval (seconds).
 # Catches candidates that hang only after many calls (invisible to short smoke probes).
@@ -25,6 +76,31 @@ SHAPING_FN_TIMEOUT_S = 0.05
 # shaping_call.py. Larger pools tolerate more leaked (timed-out) threads
 # before executor replacement is required.
 SHAPING_FN_EXECUTOR_WORKERS = 8
+
+# --------------------------------------------------------------------------- #
+# Parallel candidate execution (new)
+# --------------------------------------------------------------------------- #
+# How many candidates eureka/loop.py trains+evaluates SIMULTANEOUSLY, each in
+# its own OS process (ProcessPoolExecutor, spawn context). 1 = fully
+# sequential, identical control flow to the original implementation (and what
+# the test suite exercises). See the module docstring above for why the
+# default is intentionally 1.
+#
+# Sizing guidance for an N-vCPU, no-GPU machine:
+#   usable_cores = N_vcpu - 4                      (reserve for OS/orchestrator)
+#   MAX_CONCURRENT_CANDIDATES ~= usable_cores // (EUREKA_N_ENVS + TORCH_THREADS_PER_WORKER)
+# e.g. 124 vCPU, EUREKA_N_ENVS=16, TORCH_THREADS_PER_WORKER=2:
+#   (124 - 4) // (16 + 2) = 6 concurrent candidates, ~96 env worker processes
+#   + 6 training processes + orchestrator, comfortably under 124.
+MAX_CONCURRENT_CANDIDATES = int(os.environ.get("EUREKA_MAX_CONCURRENT_CANDIDATES", "1"))
+
+# Threads PyTorch is allowed to use PER candidate worker process. Left at
+# PyTorch's default (which greedily grabs every visible core), N concurrent
+# candidate processes will each try to use ALL cores, causing severe
+# oversubscription/contention that makes parallel execution SLOWER than
+# sequential. Explicit pinning (set in the worker before importing torch)
+# avoids this. 2 is plenty for this project's tiny 256x256 MLP.
+TORCH_THREADS_PER_WORKER = int(os.environ.get("EUREKA_TORCH_THREADS_PER_WORKER", "2"))
 
 # --- multi-objective selection ---
 # Default is "pareto": the bounded epsilon/NSGA-II-lite archive is authoritative
@@ -59,9 +135,11 @@ PARETO_ARCHIVE_SIZE = 6
 REFLECTION_ELITES = 3
 
 # Retrain Pareto rank-0 finalists on independent seeds before reporting the
-# final archive. Each seed adds a full PPO train/eval; two seeds is a practical
-# default after moving from shadow analysis to authoritative Pareto mode.
-CONFIRMATION_SEEDS = (10000, 20000)
+# final archive. Each seed adds a full PPO train/eval; now that confirmation
+# runs concurrently (see loop.py) too, more seeds cost wall-clock much less
+# than they used to, and directly attack the seed-noise problem documented
+# above (TRAIN_STEPS_PER_CANDIDATE comment).
+CONFIRMATION_SEEDS = (10000, 20000, 30000, 40000)
 
 # --- legacy scalar fitness (diagnostic only; does not drive selection in "pareto") ---
 # fitness = -FITNESS_WEIGHTS["crash"] * crash_rate
@@ -76,7 +154,10 @@ FITNESS_WEIGHTS = {
     "overtakes": 0.3,
 }
 
-N_EVAL_EPISODES = 30       # deterministic evaluation episodes used to compute objectives
+N_EVAL_EPISODES = int(os.environ.get("EUREKA_N_EVAL_EPISODES", "50"))
+                            # Raised from 30 -> 50 for finer crash_rate quantization
+                            # (1/50 = 2% steps vs 1/30 = 3.3%); eval is comparatively
+                            # cheap so this is affordable on the new hardware.
 
 # If True, generation 0 includes one extra candidate (in addition to the
 # K LLM-generated ones) seeded from the hand-written baseline reward in
@@ -93,22 +174,10 @@ def candidate_base_seed(generation: int, k: int) -> int:
     Base seed for one candidate's vector env. Each candidate in a generation
     owns a disjoint block of EUREKA_N_ENVS consecutive seeds so sibling
     candidates never share RNG state across their parallel sub-envs.
-
-    IMPORTANT: the stride reserves K_CANDIDATES + 1 slots per generation
-    (not just K_CANDIDATES). Generation 0 can train K_CANDIDATES + 1
-    candidates when SEED_GENERATION_0_WITH_HUMAN_REWARD is True (the human
-    seed is prepended at index 0, LLM candidates occupy k=1..K_CANDIDATES).
-    With a stride of exactly K_CANDIDATES * EUREKA_N_ENVS, generation 0's
-    last candidate (k == K_CANDIDATES) and generation 1's first candidate
-    (k == 0) previously computed the SAME base seed and therefore trained
-    on identical stochastic rollouts - a silent RNG collision that
-    confounded both within-generation ranking and cross-generation
-    reflection. Reserving one extra slot per generation fixes this
-    unconditionally (regardless of whether the human seed is enabled),
-    at the cost of one unused seed block per generation after gen 0.
+    Deterministic by (generation, k) regardless of execution order, so this
+    stays correct whether candidates train sequentially or concurrently.
     """
-    slots_per_generation = K_CANDIDATES + 1
-    return generation * slots_per_generation * EUREKA_N_ENVS + k * EUREKA_N_ENVS
+    return generation * K_CANDIDATES * EUREKA_N_ENVS + k * EUREKA_N_ENVS
 
 
 # --- LLM ---

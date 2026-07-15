@@ -8,6 +8,21 @@ nondominated sorting, crowding diversity, and a bounded elite archive.
 
 All ordering is deterministic. That matters because PPO evaluations are
 expensive: rerunning the same recorded metrics must produce the same archive.
+
+--------------------------------------------------------------------------
+Fix (P0): epsilon-box tie-break was quality-blind
+--------------------------------------------------------------------------
+update_archive() deduplicates candidates that land in the same epsilon-box
+(i.e. are indistinguishable at the configured measurement resolution).
+Previously the box's representative was picked by `candidate_id` (a SHA256
+hash of the candidate's source code) — whichever candidate happened to hash
+lower won, regardless of which one actually had better metrics. That could
+silently drop a genuinely-better candidate from the archive.
+
+_ideal_point_distance() (shared with select_representative's existing knee
+logic) now breaks these ties by actual closeness to the ideal point in
+normalized, direction-aware space, falling back to candidate_id only for a
+literal exact tie (to stay fully deterministic).
 """
 
 from __future__ import annotations
@@ -63,6 +78,31 @@ def dominates(a: dict, b: dict, specs: tuple[dict, ...]) -> bool:
     return all(x <= y for x, y in zip(box_a, box_b)) and any(
         x < y for x, y in zip(box_a, box_b)
     )
+
+
+def _ideal_point_distance(candidate: dict, specs: tuple[dict, ...]) -> float:
+    """
+    Squared distance to the ideal point in normalized, direction-aware
+    [0, 1] space (0 = best possible, 1 = worst possible per configured
+    bounds). Lower is better.
+
+    Used for two purposes:
+      1. select_representative()'s unweighted knee pick (original use).
+      2. update_archive()'s epsilon-box tie-break (P0 fix) — when two
+         distinct candidates land in the same box, the archive should keep
+         whichever is genuinely closer to ideal, not whichever's code hash
+         happens to sort first.
+    """
+    squared = 0.0
+    for spec in specs:
+        value = float(candidate["metrics"][spec["metric"]])
+        lower, upper = map(float, spec["bounds"])
+        span = upper - lower
+        normalized = (value - lower) / span if span else 0.0
+        normalized = min(1.0, max(0.0, normalized))
+        loss = normalized if spec["direction"] == "min" else 1.0 - normalized
+        squared += loss * loss
+    return squared
 
 
 def nondominated_sort(population: list[dict], specs: tuple[dict, ...]) -> list[list[int]]:
@@ -175,6 +215,12 @@ def update_archive(
     Combine, code-deduplicate, epsilon-box-deduplicate, rank, and truncate.
     One deterministic representative per epsilon box avoids retaining metric
     differences below the configured practical resolution.
+
+    Epsilon-box tie-break (P0 fix): when multiple distinct candidates share
+    a box, keep whichever is genuinely closer to the ideal point
+    (_ideal_point_distance), not whichever's code hash sorts first. Iteration
+    order is still by candidate_id for determinism, but it no longer decides
+    WHICH candidate wins a shared box — only the (rare) exact-tie fallback.
     """
     if capacity <= 0:
         return []
@@ -191,7 +237,20 @@ def update_archive(
     by_box: dict[tuple[int, ...], dict] = {}
     for candidate in sorted(by_code.values(), key=candidate_id):
         box = epsilon_box(candidate["metrics"], specs)
-        by_box.setdefault(box, candidate)
+        existing = by_box.get(box)
+        if existing is None:
+            by_box[box] = candidate
+            continue
+
+        new_distance = _ideal_point_distance(candidate, specs)
+        existing_distance = _ideal_point_distance(existing, specs)
+        if new_distance < existing_distance - 1e-12:
+            by_box[box] = candidate
+        elif (
+            abs(new_distance - existing_distance) <= 1e-12
+            and candidate_id(candidate) < candidate_id(existing)
+        ):
+            by_box[box] = candidate
 
     candidates = list(by_box.values())
     fronts = annotate_population(candidates, specs)
@@ -221,16 +280,7 @@ def select_representative(archive: list[dict], specs: tuple[dict, ...]) -> dict 
         return None
 
     def distance(candidate: dict) -> tuple[float, str]:
-        squared = 0.0
-        for spec in specs:
-            value = float(candidate["metrics"][spec["metric"]])
-            lower, upper = map(float, spec["bounds"])
-            span = upper - lower
-            normalized = (value - lower) / span if span else 0.0
-            normalized = min(1.0, max(0.0, normalized))
-            loss = normalized if spec["direction"] == "min" else 1.0 - normalized
-            squared += loss * loss
-        return math.sqrt(squared), candidate_id(candidate)
+        return _ideal_point_distance(candidate, specs), candidate_id(candidate)
 
     return min(front, key=distance)
 
