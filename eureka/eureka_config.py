@@ -41,7 +41,7 @@ import os
 
 # --- evolutionary search ---
 N_GENERATIONS = 3          # how many rounds of candidate generation + training
-K_CANDIDATES = int(os.environ.get("EUREKA_K_CANDIDATES", "8"))
+K_CANDIDATES = 8
                             # how many reward candidates the LLM proposes per generation.
                             # Bumped from 4 -> 8: with only 4 children per generation,
                             # a 3-generation run empirically failed to ever improve on
@@ -50,7 +50,7 @@ K_CANDIDATES = int(os.environ.get("EUREKA_K_CANDIDATES", "8"))
                             # with per round.
 
 # --- per-candidate training budget ---
-TRAIN_STEPS_PER_CANDIDATE = int(os.environ.get("EUREKA_TRAIN_STEPS_PER_CANDIDATE", "150000"))
+TRAIN_STEPS_PER_CANDIDATE = 75000
                             # Raised from 50_000 -> 150_000. Confirmation runs on a
                             # many-vCPU box showed the SAME unmodified candidate
                             # swinging from mean_overtakes=1.53 -> 0.80 -> 1.53 and
@@ -61,7 +61,7 @@ TRAIN_STEPS_PER_CANDIDATE = int(os.environ.get("EUREKA_TRAIN_STEPS_PER_CANDIDATE
                             # this variance; affordable now that concurrent candidate
                             # training (below) no longer makes this a purely serial
                             # wall-clock cost.
-EUREKA_N_ENVS = int(os.environ.get("EUREKA_N_ENVS", "16"))
+EUREKA_N_ENVS = 6
                             # Raised from 4 -> 16. Bottleneck for a tiny 256x256 MLP
                             # on CPU is environment-stepping throughput, not matrix
                             # multiplication - more parallel envs per candidate directly
@@ -92,7 +92,7 @@ SHAPING_FN_EXECUTOR_WORKERS = 8
 # e.g. 124 vCPU, EUREKA_N_ENVS=16, TORCH_THREADS_PER_WORKER=2:
 #   (124 - 4) // (16 + 2) = 6 concurrent candidates, ~96 env worker processes
 #   + 6 training processes + orchestrator, comfortably under 124.
-MAX_CONCURRENT_CANDIDATES = int(os.environ.get("EUREKA_MAX_CONCURRENT_CANDIDATES", "1"))
+MAX_CONCURRENT_CANDIDATES = 1
 
 # Threads PyTorch is allowed to use PER candidate worker process. Left at
 # PyTorch's default (which greedily grabs every visible core), N concurrent
@@ -100,7 +100,7 @@ MAX_CONCURRENT_CANDIDATES = int(os.environ.get("EUREKA_MAX_CONCURRENT_CANDIDATES
 # oversubscription/contention that makes parallel execution SLOWER than
 # sequential. Explicit pinning (set in the worker before importing torch)
 # avoids this. 2 is plenty for this project's tiny 256x256 MLP.
-TORCH_THREADS_PER_WORKER = int(os.environ.get("EUREKA_TORCH_THREADS_PER_WORKER", "2"))
+TORCH_THREADS_PER_WORKER = 1
 
 # --- multi-objective selection ---
 # Default is "pareto": the bounded epsilon/NSGA-II-lite archive is authoritative
@@ -139,7 +139,7 @@ REFLECTION_ELITES = 3
 # runs concurrently (see loop.py) too, more seeds cost wall-clock much less
 # than they used to, and directly attack the seed-noise problem documented
 # above (TRAIN_STEPS_PER_CANDIDATE comment).
-CONFIRMATION_SEEDS = (10000, 20000, 30000, 40000)
+CONFIRMATION_SEEDS = (10000, 20000)
 
 # --- legacy scalar fitness (diagnostic only; does not drive selection in "pareto") ---
 # fitness = -FITNESS_WEIGHTS["crash"] * crash_rate
@@ -154,7 +154,7 @@ FITNESS_WEIGHTS = {
     "overtakes": 0.3,
 }
 
-N_EVAL_EPISODES = int(os.environ.get("EUREKA_N_EVAL_EPISODES", "50"))
+N_EVAL_EPISODES = 50
                             # Raised from 30 -> 50 for finer crash_rate quantization
                             # (1/50 = 2% steps vs 1/30 = 3.3%); eval is comparatively
                             # cheap so this is affordable on the new hardware.
