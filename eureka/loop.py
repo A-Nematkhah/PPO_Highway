@@ -16,32 +16,6 @@ Run with:
     python -m eureka.loop
 
 Requires: GROQ_API_KEY environment variable set (see llm_reward_designer.py)
-
---------------------------------------------------------------------------
-Changes in this revision
---------------------------------------------------------------------------
-P0 fixes:
-  - total_duration is now measured AFTER _confirm_archive finishes, not
-    before. Previously a run that logged "run finished (183m53s)" had
-    actually taken ~248 minutes wall-clock — confirmation (~65 min here)
-    ran after the timer was already read.
-  - Training/eval failures are now caught as `except Exception` instead
-    of `except RuntimeError` only. A single unexpected error (anything
-    other than RuntimeError) used to be able to kill an entire multi-hour
-    run with nothing saved from that generation.
-  - eureka/objectives.py: epsilon-box tie-break is now quality-based
-    instead of code-hash-based (see that file's docstring).
-
-New capability: optional concurrent candidate training. Set
-MAX_CONCURRENT_CANDIDATES > 1 in eureka_config.py (or via the
-EUREKA_MAX_CONCURRENT_CANDIDATES env var) to train+evaluate multiple
-candidates simultaneously in separate OS processes — useful on a
-many-vCPU, no-GPU machine where the bottleneck is environment-stepping
-throughput, not matrix multiplication. Default stays at 1 (fully
-sequential) so the existing test suite, which monkeypatches
-train_candidate/evaluate_candidate/smoke_test in-process, keeps working
-unchanged: those monkeypatches are invisible to a separate spawned
-process, so parallel execution is only exercised in real (unmocked) runs.
 """
 
 import json
@@ -114,7 +88,6 @@ def _log_banner():
 
 
 def _aggregate_metrics(runs: list[dict]) -> dict:
-    """Mean objective metrics across independent confirmation runs."""
     keys = ("crash_rate", "mean_speed", "mean_overtakes", "mean_raw_return")
     return {
         key: sum(float(run[key]) for run in runs) / len(runs)
@@ -123,7 +96,6 @@ def _aggregate_metrics(runs: list[dict]) -> dict:
 
 
 def _json_safe(value):
-    """Convert non-finite NSGA-II boundary distances to strict JSON null."""
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if isinstance(value, dict):
@@ -134,12 +106,6 @@ def _json_safe(value):
 
 
 def _pin_worker_threads() -> None:
-    """
-    Must run BEFORE importing torch inside a worker process. Without this,
-    every concurrent candidate process tries to use ALL visible cores,
-    causing oversubscription that can make parallel execution slower than
-    sequential. Called at the top of every ProcessPoolExecutor worker.
-    """
     threads = str(max(1, TORCH_THREADS_PER_WORKER))
     os.environ["OMP_NUM_THREADS"] = threads
     os.environ["MKL_NUM_THREADS"] = threads
@@ -147,15 +113,7 @@ def _pin_worker_threads() -> None:
     torch.set_num_threads(max(1, TORCH_THREADS_PER_WORKER))
 
 
-# --------------------------------------------------------------------------- #
-# Worker functions for ProcessPoolExecutor (must be module-level to pickle).
-# Each one NEVER raises across the process boundary: failures are captured
-# and returned as data so one candidate's crash cannot take down its
-# siblings or the pool itself.
-# --------------------------------------------------------------------------- #
-
 def _run_candidate_worker(job: dict) -> dict:
-    """Trains + evaluates ONE already-smoke-tested, already-saved candidate."""
     _pin_worker_threads()
     from eureka.evaluate_candidate import evaluate_candidate as _evaluate_candidate
     from eureka.train_candidate import train_candidate as _train_candidate
@@ -200,7 +158,6 @@ def _run_candidate_worker(job: dict) -> dict:
 
 
 def _run_confirmation_worker(job: dict) -> dict:
-    """Retrains + re-evaluates ONE (candidate, independent seed) pair."""
     _pin_worker_threads()
     from eureka.evaluate_candidate import evaluate_candidate as _evaluate_candidate
     from eureka.train_candidate import train_candidate as _train_candidate
@@ -224,18 +181,12 @@ def _run_confirmation_worker(job: dict) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-# Smoke test + save (always sequential — cheap, and it's the gate that
-# decides which candidates are even worth spending training compute on).
-# --------------------------------------------------------------------------- #
-
 def _smoke_test_and_save(
     candidates_code: list[str],
     generation: int,
     human_seed_index: int | None,
     telemetry: Telemetry,
 ) -> list[dict]:
-    """Returns a list of surviving candidates: [{"k", "code", "module_path", "source"}, ...]."""
     survivors = []
     for k, code in enumerate(candidates_code):
         source = "human_seed" if k == human_seed_index else "llm"
@@ -327,9 +278,6 @@ def _log_candidate_rejected(generation: int, k: int, stage: str, reason: str) ->
 def _train_and_evaluate_sequential(
     survivors: list[dict], generation: int, telemetry: Telemetry,
 ) -> list[dict]:
-    """Original, fully in-process control flow. Used when
-    MAX_CONCURRENT_CANDIDATES <= 1 — this is also the path the test suite's
-    monkeypatching of train_candidate/evaluate_candidate exercises."""
     generation_results = []
 
     for survivor in survivors:
@@ -356,8 +304,6 @@ def _train_and_evaluate_sequential(
                 if history:
                     component_history = history
         except Exception as e:
-            # P0 fix: was `except RuntimeError` only — any other exception
-            # used to propagate and kill the entire multi-hour run.
             _log_candidate_rejected(generation, k, "train", str(e))
             continue
 
@@ -380,11 +326,6 @@ def _train_and_evaluate_sequential(
 def _train_and_evaluate_parallel(
     survivors: list[dict], generation: int, telemetry: Telemetry,
 ) -> list[dict]:
-    """
-    Trains + evaluates up to MAX_CONCURRENT_CANDIDATES survivors at once,
-    each in its own OS process. See the eureka_config.py module docstring
-    for sizing guidance and why this is opt-in rather than default.
-    """
     jobs = [
         {
             "k": s["k"],
@@ -408,9 +349,6 @@ def _train_and_evaluate_parallel(
             try:
                 worker_result = future.result()
             except Exception as e:
-                # Should be rare — the worker itself already catches training/
-                # eval exceptions internally. This covers pool-level failures
-                # (e.g. a worker process crashing outright).
                 worker_result = {"k": k, "stage": "pool_error", "error": str(e), "duration_s": 0.0}
 
             if worker_result.get("error"):
@@ -427,8 +365,6 @@ def _train_and_evaluate_parallel(
             _log_candidate_complete(generation, k, survivor["source"], result["fitness"], cand_duration, metrics, telemetry, survivor["module_path"])
             generation_results.append(result)
 
-    # Keep result ordering deterministic (by candidate index) regardless of
-    # which worker happened to finish first.
     generation_results.sort(key=lambda r: r["candidate_index"])
     return generation_results
 
@@ -443,12 +379,7 @@ def _train_and_evaluate_generation(
     return _train_and_evaluate_parallel(survivors, generation, telemetry)
 
 
-# --------------------------------------------------------------------------- #
-# Confirmation: retrain Pareto rank-0 finalists on independent seeds
-# --------------------------------------------------------------------------- #
-
 def _confirm_archive_sequential(finalists: list[dict], telemetry: Telemetry) -> tuple[dict, dict]:
-    """Original in-process control flow — exercised by test_confirmation.py."""
     runs_by_candidate = {candidate_id(c): [c["metrics"]] for c in finalists}
     records_by_candidate: dict[str, list[dict]] = {candidate_id(c): [] for c in finalists}
 
@@ -476,7 +407,6 @@ def _confirm_archive_sequential(finalists: list[dict], telemetry: Telemetry) -> 
 
 
 def _confirm_archive_parallel(finalists: list[dict], telemetry: Telemetry) -> tuple[dict, dict]:
-    """Retrains all (finalist, seed) pairs concurrently across processes."""
     jobs = [
         {
             "candidate_id": candidate_id(candidate),
@@ -524,11 +454,6 @@ def _confirm_archive_parallel(finalists: list[dict], telemetry: Telemetry) -> tu
 
 
 def _confirm_archive(archive: list[dict], telemetry: Telemetry) -> list[dict]:
-    """
-    Optionally retrain rank-zero finalists on independent seeds. Disabled by
-    default because confirmation adds one full train/eval per configured seed
-    (though with MAX_CONCURRENT_CANDIDATES > 1 those runs happen concurrently).
-    """
     if not CONFIRMATION_SEEDS:
         return archive
 
@@ -566,10 +491,18 @@ def main():
     telemetry = Telemetry()
     _log_banner()
 
-    best = None  # legacy scalar winner, used only while mode == "shadow"
+    best = None
     pareto_archive = []
     full_log = []
     run_start = time.perf_counter()
+    # P1 fix: track how many generations returned zero candidates from the
+    # LLM (e.g. every call failed with RequestTooLargeError even after the
+    # one retry in generate_candidates, or every response was unparseable).
+    # Previously this was only a single WARNING line per occurrence, easy to
+    # miss in an hours-long log — a run could silently lose a third of its
+    # search budget with nothing surfacing that fact until someone happened
+    # to notice the archive was smaller than expected.
+    empty_generations: list[int] = []
 
     for generation in range(N_GENERATIONS):
         gen_start = time.perf_counter()
@@ -592,8 +525,6 @@ def main():
             )
             llm_ctx["n_received"] = len(candidates_code)
 
-        # Extra generation-0 slot: human-authored baseline (EUREKA Sec 4.4).
-        # Not counted against K_CANDIDATES; only prepended once in generation 0.
         human_seed_index = None
         if generation == 0 and SEED_GENERATION_0_WITH_HUMAN_REWARD:
             from eureka.human_seed import HUMAN_SEED_CODE
@@ -601,9 +532,25 @@ def main():
             human_seed_index = 0
 
         if not candidates_code:
-            logger.warning(
-                "no candidates returned from LLM",
-                extra={"event": "llm_empty", "generation": generation},
+            empty_generations.append(generation)
+            # P1 fix: escalated from a single WARNING to an ERROR-level,
+            # impossible-to-miss log line plus a dedicated telemetry event
+            # (distinct from the generic "generation_complete" row so it's
+            # trivially greppable: `grep generation_all_candidates_failed`).
+            logger.error(
+                "ALL LLM CANDIDATES FAILED THIS GENERATION - generation "
+                "budget lost entirely (check llm_call_error / "
+                "llm_call_request_too_large events above for the cause)",
+                extra={
+                    "event": "generation_all_candidates_failed",
+                    "generation": generation,
+                    "k_requested": K_CANDIDATES,
+                },
+            )
+            telemetry.record(
+                "generation_all_candidates_failed",
+                generation=generation,
+                k_requested=K_CANDIDATES,
             )
             full_log.append({
                 "generation": generation,
@@ -613,6 +560,7 @@ def main():
                 ),
                 "archive_size": len(pareto_archive),
                 "selection_mode": MULTI_OBJECTIVE_MODE,
+                "all_candidates_failed": True,
             })
             telemetry.record(
                 "generation_complete",
@@ -650,8 +598,6 @@ def main():
             )
             continue
 
-        # Compute within-generation metadata for both modes. Shadow mode keeps
-        # legacy behavior while making disagreement with Pareto visible.
         generation_fronts = annotate_population(generation_results, OBJECTIVE_SPECS)
         generation_front_ids = [
             generation_results[index]["candidate_id"]
@@ -752,7 +698,6 @@ def main():
                     },
                 )
         else:
-            # No weighted score is authoritative in Pareto mode.
             best = representative
 
         with open(LOG_PATH, "w", encoding="utf-8") as f:
@@ -768,10 +713,6 @@ def main():
         with open(LOG_PATH, "w", encoding="utf-8") as f:
             json.dump(_json_safe(full_log), f, indent=2, default=str, allow_nan=False)
 
-    # P0 fix: total_duration is measured here, AFTER _confirm_archive, so it
-    # reflects the run's real wall-clock time. Previously this line ran
-    # before confirmation (which can take tens of minutes), so the reported
-    # duration silently undercounted every run that had CONFIRMATION_SEEDS set.
     total_duration = round(time.perf_counter() - run_start, 4)
 
     telemetry.record(
@@ -792,10 +733,9 @@ def main():
             for candidate in pareto_archive
             if candidate.get("pareto_rank") == 0
         ],
+        empty_generations=empty_generations,
     )
 
-    # Best-effort plotting: a failure here (e.g. matplotlib missing) must
-    # never take down a completed multi-hour search run.
     try:
         from eureka.plots import generate_run_plots
         plot_path = generate_run_plots(full_log, pareto_archive, PLOTS_DIR)
@@ -808,6 +748,10 @@ def main():
         logger.warning("run finished with no successful candidate", extra={"event": "run_empty"})
         return
 
+    # P1 fix: a run can "finish" with a usable archive while still having
+    # silently lost one or more generations to LLM failures. Surface that
+    # loudly in the final summary log line instead of requiring someone to
+    # grep the whole run for generation_all_candidates_failed.
     logger.info(
         "EUREKA run finished",
         extra={
@@ -822,8 +766,22 @@ def main():
                 candidate.get("pareto_rank") == 0 for candidate in pareto_archive
             ),
             "archive_size": len(pareto_archive),
+            "generations_with_zero_candidates": empty_generations,
         },
     )
+    if empty_generations:
+        logger.error(
+            f"RUN COMPLETED BUT {len(empty_generations)}/{N_GENERATIONS} "
+            f"GENERATIONS RETURNED ZERO CANDIDATES (generations: "
+            f"{empty_generations}) - search budget was silently reduced; "
+            "see generation_all_candidates_failed events above",
+            extra={
+                "event": "run_completed_with_empty_generations",
+                "empty_generation_count": len(empty_generations),
+                "total_generations": N_GENERATIONS,
+                "empty_generations": empty_generations,
+            },
+        )
 
 
 if __name__ == "__main__":

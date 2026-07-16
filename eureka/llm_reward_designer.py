@@ -88,6 +88,26 @@ def _extract_code(text: str) -> str | None:
     return None
 
 
+def _call_llm(manager, model: str, temperature: float, user_prompt: str):
+    """One raw chat_completion call. Raises RequestTooLargeError / other
+    exceptions to the caller unchanged - retry policy lives in the caller."""
+    return manager.chat_completion(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+        # gpt-oss models are reasoning models: their internal
+        # chain-of-thought counts against max_tokens BEFORE any
+        # visible answer is produced. 500 was entirely eaten by
+        # reasoning (finish_reason="length", content=""), so give
+        # plenty of headroom and cap the reasoning effort.
+        max_tokens=4000,
+        reasoning_effort="low",
+    )
+
+
 def generate_candidates(elites: dict | list[dict] | None, k: int, generation: int,
                          model: str, temperature: float) -> list[str]:
     """
@@ -98,8 +118,17 @@ def generate_candidates(elites: dict | list[dict] | None, k: int, generation: in
     Returns a list of up to k code strings (fewer if some API calls failed
     or didn't contain a parseable code block - loop.py handles that via
     smoke_test.py rejecting/skipping bad candidates).
+
+    P1 fix: build_reflection() already caps prompt size at the source (see
+    reflection.py), so a 413/"request too large" response should be rare.
+    As defense in depth, a RequestTooLargeError is still caught here and
+    retried EXACTLY ONCE per candidate with a forcibly minimal context
+    (single highest-priority elite, no component detail) rather than
+    silently losing that candidate slot entirely - this is what let
+    generation 2 lose all 8 LLM calls at once in a prior run, with nothing
+    but a one-line WARNING in the log.
     """
-    from key_manager import get_key_manager
+    from key_manager import get_key_manager, RequestTooLargeError
     manager = get_key_manager()
 
     candidates = []
@@ -120,21 +149,27 @@ def generate_candidates(elites: dict | list[dict] | None, k: int, generation: in
         )
         call_start = time.perf_counter()
         try:
-            response = manager.chat_completion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=temperature,
-                # gpt-oss models are reasoning models: their internal
-                # chain-of-thought counts against max_tokens BEFORE any
-                # visible answer is produced. 500 was entirely eaten by
-                # reasoning (finish_reason="length", content=""), so give
-                # plenty of headroom and cap the reasoning effort.
-                max_tokens=4000,
-                reasoning_effort="low",
-            )
+            try:
+                response = _call_llm(manager, model, temperature, user_prompt)
+            except RequestTooLargeError as e:
+                logger.warning(
+                    "LLM request too large, retrying with minimal context",
+                    extra={
+                        "event": "llm_call_request_too_large",
+                        "generation": generation,
+                        "index": i + 1,
+                        "prompt_chars": len(user_prompt),
+                        "error": str(e),
+                    },
+                )
+                minimal_elites = None
+                if isinstance(elites, dict):
+                    minimal_elites = elites
+                elif elites:
+                    minimal_elites = elites[0]
+                minimal_prompt = build_reflection(minimal_elites, target_role=target_role)
+                response = _call_llm(manager, model, temperature, minimal_prompt)
+
             text = response.choices[0].message.content
             code = _extract_code(text)
             elapsed = round(time.perf_counter() - call_start, 4)

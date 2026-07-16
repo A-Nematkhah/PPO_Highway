@@ -176,8 +176,35 @@ def candidate_base_seed(generation: int, k: int) -> int:
     candidates never share RNG state across their parallel sub-envs.
     Deterministic by (generation, k) regardless of execution order, so this
     stays correct whether candidates train sequentially or concurrently.
+
+    --------------------------------------------------------------------
+    P0 fix: per-generation stride must reserve K_CANDIDATES + 1 blocks
+    --------------------------------------------------------------------
+    Previously the stride was `K_CANDIDATES * EUREKA_N_ENVS`. But when
+    SEED_GENERATION_0_WITH_HUMAN_REWARD is True, generation 0 actually
+    trains K_CANDIDATES LLM candidates PLUS one extra human-seed candidate
+    at slot k == K_CANDIDATES (prepended in loop.py). That extra slot's
+    seed block was never reserved by the old stride, so it landed exactly
+    on top of the NEXT generation's k == 0 block:
+
+        old_seed(generation=0, k=K_CANDIDATES)  == old_seed(generation=1, k=0)
+
+    i.e. generation 0's human-seed candidate and generation 1's first LLM
+    candidate trained on byte-for-byte identical stochastic rollouts -
+    two structurally different reward functions sharing RNG state, which
+    corrupts the seed-independence the search's reflection signal depends
+    on (confirmed by test_seeds.py::test_human_seed_slot_does_not_collide_
+    with_next_generation, which was failing under the old formula).
+
+    The stride now always reserves K_CANDIDATES + 1 seed blocks per
+    generation, whether or not the human-seed slot is actually used that
+    generation. This keeps the formula correct and fully order-independent
+    without needing to reference SEED_GENERATION_0_WITH_HUMAN_REWARD here,
+    at the minor cost of one permanently-unused seed block per generation
+    after generation 0.
     """
-    return generation * K_CANDIDATES * EUREKA_N_ENVS + k * EUREKA_N_ENVS
+    slots_per_generation = K_CANDIDATES + 1
+    return generation * slots_per_generation * EUREKA_N_ENVS + k * EUREKA_N_ENVS
 
 
 # --- LLM ---
