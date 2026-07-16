@@ -173,23 +173,67 @@ SCREENING_SECOND_SEED_ENABLED = True
 # collide with another candidate's reserved seed block.
 SCREENING_SECOND_SEED_OFFSET = 10_000_000
 
-# --- legacy scalar fitness (diagnostic only; does not drive selection in "pareto") ---
+# --------------------------------------------------------------------------- #
+# Legacy scalar fitness (P2 fix #6 - rebalanced weighting)
+# --------------------------------------------------------------------------- #
 # fitness = -FITNESS_WEIGHTS["crash"] * crash_rate
 #           + FITNESS_WEIGHTS["speed"] * mean_speed
 #           + FITNESS_WEIGHTS["overtakes"] * mean_overtakes
-# crash_rate is a fraction in [0, 1], mean_speed is in m/s (~15-30),
-# mean_overtakes is a small integer per episode (~0-5) - weights are scaled
-# accordingly so no single term dominates by unit magnitude alone.
+#
+# IMPORTANT: with MULTI_OBJECTIVE_MODE="pareto" (the default), this scalar
+# does NOT drive survivor selection or LLM reflection elites - that is
+# handled entirely by eureka.objectives' epsilon/NSGA-II-lite archive, which
+# treats crash_rate/mean_speed/mean_overtakes as independent objectives with
+# no arbitrary cross-weighting. `legacy_fitness` is diagnostic-only, surfaced
+# in eureka_log.json / plots.py / the console for a *quick* sanity read.
+#
+# That diagnostic value is still misleading if badly calibrated, though.
+# The previous weights (crash=1.0, speed=0.05, overtakes=0.3) let a modest
+# speed improvement mask a much worse crash rate: a candidate going from
+# crash_rate=0.27 -> 0.52 (nearly doubling its crash rate) while also
+# gaining ~5 m/s of speed showed fitness *improving* (1.38 -> 1.76), because
+# 5 m/s * 0.05 (=0.25) outweighed 0.25 * 1.0 (=0.25) crash penalty almost
+# exactly, before overtakes tipped it further into "looks better."
+#
+# Rebalanced so that crash_rate dominates the diagnostic score by a wide
+# margin, matching how a human would actually read "is this reward function
+# safe": the crash weight is raised well above what any plausible speed or
+# overtake gain could offset, while speed/overtakes weights are trimmed
+# proportionally so the score doesn't blow up in magnitude. Concretely, the
+# same example above now nets a LARGE fitness drop (0.25 * 3.0 = 0.75)
+# instead of a small net-positive move, even after adding back the ~5 m/s
+# speed gain (5 * 0.03 = 0.15).
+#
+# This is still a diagnostic-only heuristic, not a substitute for the Pareto
+# archive - it has no epsilon deadband, no notion of trade-off fronts, and a
+# single scalar can never fully represent a 3-objective trade-off. Treat
+# `legacy_fitness` in logs as "rough, safety-weighted sanity check", not as
+# a ranking to optimize against.
 FITNESS_WEIGHTS = {
-    "crash": 1.0,
-    "speed": 0.05,
-    "overtakes": 0.3,
+    "crash": 3.0,
+    "speed": 0.03,
+    "overtakes": 0.2,
 }
 
-N_EVAL_EPISODES = 50
-                            # Raised from 30 -> 50 for finer crash_rate quantization
-                            # (1/50 = 2% steps vs 1/30 = 3.3%); eval is comparatively
-                            # cheap so this is affordable on the new hardware.
+# --------------------------------------------------------------------------- #
+# Evaluation episode budget (P2 fix #7)
+# --------------------------------------------------------------------------- #
+# Previously 50. Combined with CONFIRMATION_SEEDS having 2 entries, every
+# Pareto-front finalist paid for 1 (screening) + 2 (confirmation) x 50 = 150
+# deterministic eval episodes in total - a large, and largely wasted, cost.
+# The actual source of instability documented above (TRAIN_STEPS_PER_CANDIDATE
+# comment) is PPO training-seed variance, not evaluation-episode sampling
+# noise: more eval episodes make a single noisy policy's metrics measured
+# more *precisely*, but they do nothing to reduce the variance *between*
+# training seeds, which is the real problem. SCREENING_SECOND_SEED_ENABLED
+# (above) and CONFIRMATION_SEEDS already spend budget on multi-seed
+# averaging, which directly attacks that variance instead. Trading some of
+# the eval-episode budget back (50 -> 20) frees up wall-clock without
+# reintroducing the crash_rate quantization noise problem that originally
+# motivated raising N_EVAL_EPISODES (20 episodes = 5% resolution, still far
+# finer than the 10% CONFIRMATION_SEEDS/OBJECTIVE_SPECS epsilon-box width
+# for crash_rate, so this does not blur Pareto dominance decisions).
+N_EVAL_EPISODES = 20
 
 # If True, generation 0 includes one extra candidate (in addition to the
 # K LLM-generated ones) seeded from the hand-written baseline reward in
