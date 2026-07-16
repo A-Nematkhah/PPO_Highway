@@ -105,6 +105,10 @@ def test_loop_prepends_human_seed_in_generation_zero_only(tmp_path, monkeypatch)
     monkeypatch.setattr("eureka.loop.SEED_GENERATION_0_WITH_HUMAN_REWARD", True)
     monkeypatch.setattr("eureka.loop.MULTI_OBJECTIVE_MODE", "shadow")
     monkeypatch.setattr("eureka.loop.CONFIRMATION_SEEDS", ())
+    # This test pins an exact count of evaluate_candidate calls (one per
+    # gen0/gen1 candidate) and isn't exercising second-seed screening -
+    # disable it here so it doesn't consume extra items from `metrics`.
+    monkeypatch.setattr("eureka.loop.SCREENING_SECOND_SEED_ENABLED", False)
     monkeypatch.setattr("eureka.loop.LOG_PATH", "eureka/eureka_log.json")
     monkeypatch.setattr(
         "eureka.loop.generate_candidates",

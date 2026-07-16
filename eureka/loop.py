@@ -39,6 +39,8 @@ from eureka.eureka_config import (
     OBJECTIVE_SPECS,
     PARETO_ARCHIVE_SIZE,
     REFLECTION_ELITES,
+    SCREENING_SECOND_SEED_ENABLED,
+    SCREENING_SECOND_SEED_OFFSET,
     SEED_GENERATION_0_WITH_HUMAN_REWARD,
     TORCH_THREADS_PER_WORKER,
     TRAIN_STEPS_PER_CANDIDATE,
@@ -379,6 +381,68 @@ def _train_and_evaluate_generation(
     return _train_and_evaluate_parallel(survivors, generation, telemetry)
 
 
+def _screen_confirm_front(
+    generation_results: list[dict],
+    front_indices: list[int],
+    generation: int,
+    telemetry: Telemetry,
+) -> list[dict]:
+    """
+    Retrain+reevaluate this generation's Pareto-front candidates on one extra
+    independent seed and average into their screening metrics, IN PLACE.
+
+    CONFIRMATION_SEEDS only re-checks the whole run's FINAL rank-0 archive
+    members at the very end - a candidate that got unlucky on its single
+    screening seed can be evicted from the archive by update_archive() long
+    before confirmation ever sees it. This is a cheaper, earlier version of
+    the same idea: only the current generation's front (typically a handful
+    of candidates, not all K_CANDIDATES) gets a second seed, right before
+    this generation's results are folded into the cross-generation archive.
+
+    Mutates and returns `generation_results` (only entries at `front_indices`
+    are touched) so callers can simply re-run nondominated sorting afterward
+    on the same list.
+    """
+    if not SCREENING_SECOND_SEED_ENABLED:
+        return generation_results
+
+    for index in front_indices:
+        result = generation_results[index]
+        k = result["candidate_index"]
+        second_seed = candidate_base_seed(generation, k) + SCREENING_SECOND_SEED_OFFSET
+
+        try:
+            with telemetry.timed(
+                "screening_second_seed", generation=generation, candidate=k,
+                module_path=result["module_path"], seed=second_seed,
+            ) as ctx:
+                checkpoint = train_candidate(
+                    result["module_path"], total_timesteps=TRAIN_STEPS_PER_CANDIDATE,
+                    seed=second_seed,
+                )
+                second_metrics = evaluate_candidate(
+                    checkpoint, result["module_path"], n_episodes=N_EVAL_EPISODES,
+                )
+                ctx.update(second_metrics)
+        except Exception as e:
+            logger.warning(
+                "screening second-seed run failed, keeping single-seed metrics",
+                extra={
+                    "event": "screening_second_seed_failed",
+                    "generation": generation, "candidate": k, "reason": str(e),
+                },
+            )
+            continue
+
+        result["screening_seed_1_metrics"] = result["metrics"]
+        result["screening_seed_2_metrics"] = second_metrics
+        result["metrics"] = _aggregate_metrics([result["metrics"], second_metrics])
+        result["fitness"] = compute_fitness(result["metrics"], FITNESS_WEIGHTS)
+        result["legacy_fitness"] = result["fitness"]
+
+    return generation_results
+
+
 def _confirm_archive_sequential(finalists: list[dict], telemetry: Telemetry) -> tuple[dict, dict]:
     runs_by_candidate = {candidate_id(c): [c["metrics"]] for c in finalists}
     records_by_candidate: dict[str, list[dict]] = {candidate_id(c): [] for c in finalists}
@@ -476,6 +540,18 @@ def _confirm_archive(archive: list[dict], telemetry: Telemetry) -> list[dict]:
         item["screening_metrics"] = candidate["metrics"]
         item["confirmation_runs"] = records_by_candidate.get(cid, [])
         item["metrics"] = _aggregate_metrics(runs_by_candidate.get(cid, [candidate["metrics"]]))
+
+        # Recompute fitness from the CONFIRMED metrics, not the pre-confirmation
+        # screening metrics, and point the checkpoint at the last confirmation
+        # run. Without this, the final archive shows a fitness score and a
+        # checkpoint file that don't correspond to the metrics reported next
+        # to them (both were still the screening-run values).
+        item["fitness"] = compute_fitness(item["metrics"], FITNESS_WEIGHTS)
+        item["legacy_fitness"] = item["fitness"]
+        if records_by_candidate.get(cid):
+            item["screening_checkpoint"] = candidate["checkpoint"]
+            item["checkpoint"] = records_by_candidate[cid][-1]["checkpoint"]
+
         confirmed.append(item)
 
     return update_archive([], confirmed, OBJECTIVE_SPECS, PARETO_ARCHIVE_SIZE)
@@ -598,6 +674,17 @@ def main():
             )
             continue
 
+        generation_fronts = annotate_population(generation_results, OBJECTIVE_SPECS)
+
+        # Re-screen this generation's front on a second independent seed
+        # BEFORE it is locked into the cross-generation archive or used to
+        # pick the legacy scalar winner - otherwise a genuinely good
+        # candidate can be evicted purely from single-seed noise before
+        # CONFIRMATION_SEEDS (which only runs at the very end) ever gets a
+        # chance to re-check it.
+        generation_results = _screen_confirm_front(
+            generation_results, generation_fronts[0], generation, telemetry
+        )
         generation_fronts = annotate_population(generation_results, OBJECTIVE_SPECS)
         generation_front_ids = [
             generation_results[index]["candidate_id"]

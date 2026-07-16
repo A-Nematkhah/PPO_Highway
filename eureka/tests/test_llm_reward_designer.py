@@ -13,6 +13,15 @@ def test_system_prompt_mentions_named_temperature_variable():
     assert "temp" in lowered or "scale" in lowered
 
 
+def test_system_prompt_forbids_nested_function_definitions():
+    """Regression test: gen0 previously lost ~44% of candidates to
+    'nested function definitions are not allowed' AST rejections. The
+    system prompt must explicitly warn against this pattern."""
+    lowered = SYSTEM_PROMPT.lower()
+    assert "nested" in lowered or "inner" in lowered
+    assert "def" in lowered
+
+
 @patch("key_manager.get_key_manager")
 def test_generate_candidates_parses_fenced_response(mock_get_km):
     manager = MagicMock()

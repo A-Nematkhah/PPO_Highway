@@ -71,6 +71,60 @@ def test_confirmation_aggregates_independent_seed_metrics(tmp_path, monkeypatch)
     assert [event["event"] for event in events] == ["confirmation", "confirmation"]
 
 
+def test_confirmation_updates_fitness_and_checkpoint_to_match_confirmed_metrics(
+    tmp_path, monkeypatch
+):
+    """Regression test: fitness/legacy_fitness/checkpoint must reflect the
+    CONFIRMED (seed-averaged) metrics, not the pre-confirmation screening
+    run - otherwise the final archive shows a fitness score and checkpoint
+    file that don't correspond to the metrics reported next to them."""
+    import eureka.loop as loop
+    from eureka.fitness import compute_fitness
+    from eureka.eureka_config import FITNESS_WEIGHTS
+
+    archive = [_candidate()]
+    annotate_population(archive, OBJECTIVE_SPECS)
+    monkeypatch.setattr(loop, "CONFIRMATION_SEEDS", (101, 202))
+    monkeypatch.setattr(
+        loop,
+        "train_candidate",
+        lambda module_path, total_timesteps, seed: f"confirmed_{seed}.pt",
+    )
+    rows = iter([
+        {
+            "crash_rate": 0.0,
+            "mean_speed": 22.0,
+            "mean_overtakes": 2.0,
+            "mean_raw_return": 0.7,
+        },
+        {
+            "crash_rate": 0.4,
+            "mean_speed": 24.0,
+            "mean_overtakes": 3.0,
+            "mean_raw_return": 0.9,
+        },
+    ])
+    monkeypatch.setattr(
+        loop,
+        "evaluate_candidate",
+        lambda checkpoint, module_path, n_episodes: next(rows),
+    )
+
+    telemetry = Telemetry(str(tmp_path / "metrics.jsonl"))
+    confirmed = loop._confirm_archive(archive, telemetry)
+
+    assert len(confirmed) == 1
+    result = confirmed[0]
+
+    expected_fitness = compute_fitness(result["metrics"], FITNESS_WEIGHTS)
+    assert result["fitness"] == pytest.approx(expected_fitness)
+    assert result["legacy_fitness"] == pytest.approx(expected_fitness)
+
+    # checkpoint must point at the LAST confirmation run, not the screening run
+    assert result["checkpoint"] == "confirmed_202.pt"
+    assert result["screening_checkpoint"] == "screening.pt"
+
+
 def test_confirmation_disabled_is_noop(tmp_path, monkeypatch):
     import eureka.loop as loop
 

@@ -137,6 +137,71 @@ def test_pareto_mode_keeps_tradeoffs_and_uses_unweighted_representative(
     assert all(result["pareto_rank"] == 0 for result in generation["results"])
 
 
+def test_screening_second_seed_averages_front_metrics_before_archiving(
+    tmp_path, monkeypatch
+):
+    """
+    Regression test for the seed-variance fix: the single candidate that
+    reaches this generation's Pareto front must be retrained+reevaluated on
+    one extra independent seed, and its final metrics/fitness must reflect
+    the AVERAGE of both seeds, not just the first (screening) run.
+    """
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("eureka/candidates", exist_ok=True)
+
+    monkeypatch.setattr("eureka.loop.N_GENERATIONS", 1)
+    monkeypatch.setattr("eureka.loop.K_CANDIDATES", 1)
+    monkeypatch.setattr("eureka.loop.MULTI_OBJECTIVE_MODE", "shadow")
+    monkeypatch.setattr("eureka.loop.CONFIRMATION_SEEDS", ())
+    monkeypatch.setattr("eureka.loop.SEED_GENERATION_0_WITH_HUMAN_REWARD", False)
+    monkeypatch.setattr("eureka.loop.SCREENING_SECOND_SEED_ENABLED", True)
+    monkeypatch.setattr("eureka.loop.LOG_PATH", "eureka/eureka_log.json")
+    monkeypatch.setattr(
+        "eureka.loop.generate_candidates",
+        lambda context, k, generation, model, temperature: [TRIVIAL_CANDIDATE],
+    )
+    monkeypatch.setattr("eureka.loop.smoke_test", lambda code: (True, "ok"))
+
+    train_calls = []
+
+    def fake_train(module_path, total_timesteps, seed):
+        train_calls.append(seed)
+        return f"{module_path}_{seed}.pt"
+
+    # First (screening) eval: crash_rate=0.8 (bad luck). Second (second-seed)
+    # eval: crash_rate=0.0. Average should be 0.4, not 0.8 or 0.0 alone.
+    eval_rows = iter([
+        {"crash_rate": 0.8, "mean_speed": 20.0, "mean_overtakes": 1.0, "mean_raw_return": 0.5},
+        {"crash_rate": 0.0, "mean_speed": 20.0, "mean_overtakes": 1.0, "mean_raw_return": 0.5},
+    ])
+
+    monkeypatch.setattr("eureka.loop.train_candidate", fake_train)
+    monkeypatch.setattr(
+        "eureka.loop.evaluate_candidate",
+        lambda checkpoint, module_path, n_episodes: next(eval_rows),
+    )
+
+    from eureka.loop import main
+
+    main()
+
+    log_data = json.loads(
+        (tmp_path / "eureka" / "eureka_log.json").read_text(encoding="utf-8")
+    )
+    result = log_data[0]["results"][0]
+
+    # Second seed was actually used to retrain (two distinct seeds called).
+    assert len(train_calls) == 2
+    assert train_calls[0] != train_calls[1]
+
+    # Final metrics/fitness reflect the AVERAGE of both seeds.
+    assert result["metrics"]["crash_rate"] == pytest.approx(0.4)
+    assert "screening_seed_1_metrics" in result
+    assert "screening_seed_2_metrics" in result
+    assert result["screening_seed_1_metrics"]["crash_rate"] == pytest.approx(0.8)
+    assert result["screening_seed_2_metrics"]["crash_rate"] == pytest.approx(0.0)
+
+
 def test_shadow_mode_preserves_legacy_scalar_reflection_parent(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("eureka/candidates", exist_ok=True)

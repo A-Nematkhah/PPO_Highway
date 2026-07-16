@@ -50,23 +50,33 @@ K_CANDIDATES = 8
                             # with per round.
 
 # --- per-candidate training budget ---
-TRAIN_STEPS_PER_CANDIDATE = 75000
-                            # Raised from 50_000 -> 150_000. Confirmation runs on a
-                            # many-vCPU box showed the SAME unmodified candidate
-                            # swinging from mean_overtakes=1.53 -> 0.80 -> 1.53 and
-                            # crash_rate=0.17 -> 0.27 purely from changing the training
-                            # seed. That's measurement noise, not signal, and it was
-                            # large enough to make epsilon-dominance decisions
-                            # essentially arbitrary. More steps per candidate reduces
-                            # this variance; affordable now that concurrent candidate
-                            # training (below) no longer makes this a purely serial
-                            # wall-clock cost.
-EUREKA_N_ENVS = 6
-                            # Raised from 4 -> 16. Bottleneck for a tiny 256x256 MLP
-                            # on CPU is environment-stepping throughput, not matrix
-                            # multiplication - more parallel envs per candidate directly
-                            # buys more rollout throughput. Tune down on smaller
-                            # machines via the EUREKA_N_ENVS env var.
+TRAIN_STEPS_PER_CANDIDATE = 150000
+                            # Raised from 75_000 -> 150_000 (this comment previously
+                            # claimed the raise had already happened, but the value
+                            # had drifted back down to 75_000 - now corrected).
+                            # Confirmation runs showed the SAME unmodified candidate
+                            # swinging crash_rate from 8% -> 18% -> 86% and other
+                            # metrics just as wildly, purely from changing the
+                            # training seed. That's measurement noise, not signal,
+                            # and it was large enough to make epsilon-dominance
+                            # decisions essentially arbitrary. More steps per
+                            # candidate is the single biggest lever to reduce this
+                            # variance (at ~2x wall-clock cost per candidate);
+                            # affordable now that concurrent candidate training
+                            # (below) no longer makes this a purely serial cost.
+EUREKA_N_ENVS = 12
+                            # Raised from 6 -> 12 (comment previously said 4 -> 16,
+                            # but the value had drifted to 6 - now corrected).
+                            # Bottleneck for a tiny 256x256 MLP on CPU is
+                            # environment-stepping throughput, not matrix
+                            # multiplication - more parallel envs per candidate
+                            # directly buys more rollout throughput AND more
+                            # parallel rollout diversity per PPO update, which
+                            # reduces per-update variance independent of total
+                            # steps (a second, cheaper lever against the same
+                            # seed-noise problem as TRAIN_STEPS_PER_CANDIDATE
+                            # above). Tune down on smaller machines via the
+                            # EUREKA_N_ENVS env var.
 
 # Per-step wall-clock cap on shaping_reward() during training/eval (seconds).
 # Catches candidates that hang only after many calls (invisible to short smoke probes).
@@ -140,6 +150,28 @@ REFLECTION_ELITES = 3
 # than they used to, and directly attack the seed-noise problem documented
 # above (TRAIN_STEPS_PER_CANDIDATE comment).
 CONFIRMATION_SEEDS = (10000, 20000)
+
+# --------------------------------------------------------------------------- #
+# Screening-stage second seed (new)
+# --------------------------------------------------------------------------- #
+# CONFIRMATION_SEEDS only re-checks the FINAL archive's rank-0 candidates at
+# the very end of the whole run. That leaves a gap: a candidate that got
+# unlucky on its single screening seed within a single generation can be
+# evicted from the Pareto archive by update_archive() before confirmation
+# ever gets a chance to see it - the seed-noise problem shows up one step
+# earlier than CONFIRMATION_SEEDS can catch it.
+#
+# When enabled, loop.py retrains+reevaluates only THIS generation's Pareto
+# front (typically a handful of candidates, not all K_CANDIDATES) on one
+# extra independent seed, and averages the two runs into the candidate's
+# metrics before update_archive() locks in this generation's archive
+# membership. Much cheaper than doubling TRAIN_STEPS_PER_CANDIDATE globally,
+# and complements it rather than replacing it.
+SCREENING_SECOND_SEED_ENABLED = True
+# Offset added to candidate_base_seed(generation, k) for the second seed.
+# Chosen far outside any candidate_base_seed(...) stride so it can never
+# collide with another candidate's reserved seed block.
+SCREENING_SECOND_SEED_OFFSET = 10_000_000
 
 # --- legacy scalar fitness (diagnostic only; does not drive selection in "pareto") ---
 # fitness = -FITNESS_WEIGHTS["crash"] * crash_rate
