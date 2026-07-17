@@ -50,7 +50,7 @@ K_CANDIDATES = 8
                             # with per round.
 
 # --- per-candidate training budget ---
-TRAIN_STEPS_PER_CANDIDATE = 150000
+TRAIN_STEPS_PER_CANDIDATE = 100000
                             # Raised from 75_000 -> 150_000 (this comment previously
                             # claimed the raise had already happened, but the value
                             # had drifted back down to 75_000 - now corrected).
@@ -64,7 +64,7 @@ TRAIN_STEPS_PER_CANDIDATE = 150000
                             # variance (at ~2x wall-clock cost per candidate);
                             # affordable now that concurrent candidate training
                             # (below) no longer makes this a purely serial cost.
-EUREKA_N_ENVS = 12
+EUREKA_N_ENVS = 8
                             # Raised from 6 -> 12 (comment previously said 4 -> 16,
                             # but the value had drifted to 6 - now corrected).
                             # Bottleneck for a tiny 256x256 MLP on CPU is

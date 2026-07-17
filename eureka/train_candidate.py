@@ -33,6 +33,17 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ROLLING_WINDOW = 20
 
 
+def component_sidecar_path(candidate_short_name: str) -> str:
+    checkpoint_dir = os.path.join("eureka", "checkpoints")
+    return os.path.join(checkpoint_dir, f"{candidate_short_name}_components.json")
+
+
+def _remove_stale_component_sidecar(candidate_short_name: str) -> None:
+    path = component_sidecar_path(candidate_short_name)
+    if os.path.isfile(path):
+        os.remove(path)
+
+
 def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> str:
     """
     module_path: dotted import path of the candidate's code, e.g.

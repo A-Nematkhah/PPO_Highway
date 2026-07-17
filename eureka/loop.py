@@ -49,7 +49,7 @@ from eureka.eureka_config import (
 from eureka.evaluate_candidate import evaluate_candidate
 from eureka.fitness import compute_fitness
 from eureka.llm_reward_designer import generate_candidates
-from eureka.logging_utils import get_logger
+from eureka.logging_utils import get_logger, print_final_archive_table
 from eureka.objectives import (
     annotate_population,
     candidate_id,
@@ -64,6 +64,7 @@ from eureka.train_candidate import train_candidate
 logger = get_logger(__name__)
 
 CANDIDATES_DIR = os.path.join("eureka", "candidates")
+REJECTED_DIR = os.path.join(CANDIDATES_DIR, "rejected")
 LOG_PATH = os.path.join("eureka", "eureka_log.json")
 PLOTS_DIR = os.path.join("eureka", "plots")
 
@@ -87,6 +88,95 @@ def _log_banner():
             "log_path": LOG_PATH,
         },
     )
+
+
+def _clear_stale_candidate_files() -> None:
+    """
+    Remove leftover gen*.py files from a PREVIOUS run before this run starts.
+
+    Candidate source files are only written to CANDIDATES_DIR when a
+    candidate passes the smoke test (see _smoke_test_and_save); a candidate
+    that fails smoke test THIS run is simply skipped, which means whatever
+    file happened to occupy that gen{N}_cand{k}.py path from an earlier,
+    successful run is left sitting there completely untouched by this run.
+    Nothing in the training/eval pipeline actually loads a stale file by
+    mistake - env_factory.py only ever loads module_paths that THIS run's
+    survivors list explicitly names - but it is a real footgun for a human
+    debugging a run from the filesystem: eureka/candidates/gen0_cand3.py
+    can silently be leftover code from three runs ago, with no indication
+    that this run's candidate 3 was actually rejected and never wrote
+    anything there. (Observed directly: a run that rejected candidates
+    1/2/3/5 for nested-function/getattr/lambda violations left the
+    PREVIOUS run's valid cand1/2/3/5 sitting on disk, making it look like
+    those were the rejected candidates when inspected afterward.)
+
+    Called once at the start of main() so every run starts from a clean
+    CANDIDATES_DIR - only files THIS run's survivors actually produce will
+    exist in it afterward. Rejected candidates' source is preserved
+    separately under REJECTED_DIR (see _save_rejected_candidate) so
+    debugging a rejection doesn't require re-running the whole search.
+    """
+    if os.path.isdir(CANDIDATES_DIR):
+        for name in os.listdir(CANDIDATES_DIR):
+            if name.startswith("gen") and name.endswith(".py"):
+                try:
+                    os.remove(os.path.join(CANDIDATES_DIR, name))
+                except OSError as e:
+                    logger.warning(
+                        "failed to remove stale candidate file",
+                        extra={"event": "stale_candidate_cleanup_failed", "path": name, "error": str(e)},
+                    )
+
+    if os.path.isdir(REJECTED_DIR):
+        for name in os.listdir(REJECTED_DIR):
+            if name.endswith(".py"):
+                try:
+                    os.remove(os.path.join(REJECTED_DIR, name))
+                except OSError as e:
+                    logger.warning(
+                        "failed to remove stale rejected-candidate file",
+                        extra={"event": "stale_candidate_cleanup_failed", "path": name, "error": str(e)},
+                    )
+
+
+def _save_rejected_candidate(code: str, generation: int, k: int, reason: str) -> None:
+    """
+    Persist a smoke-test-rejected candidate's EXACT source under
+    REJECTED_DIR with the rejection reason as a header comment, so a human
+    can inspect WHY the sandbox rejected it without re-running the search.
+    Previously the log line only ever recorded the reason string ("disallowed
+    syntax: Lambda", "call to 'getattr' is not allowed", ...) - the actual
+    generated code that triggered it was discarded entirely, making the
+    rejection impossible to debug or feed back into prompt-engineering
+    after the fact.
+
+    Purely a debugging aid: REJECTED_DIR is never imported or exec'd by
+    anything in the pipeline (eureka.sandbox only ever loads a candidate by
+    the module_path recorded for THIS run's survivors, and rejected
+    candidates never become survivors), so writing here cannot affect
+    training, evaluation, or which code actually runs.
+    """
+    try:
+        os.makedirs(REJECTED_DIR, exist_ok=True)
+        header = (
+            f"# REJECTED - generation={generation} candidate={k}\n"
+            f"# reason: {reason}\n"
+            f"# This file was never loaded, exec'd, or trained - it failed\n"
+            f"# eureka/sandbox.py's AST allowlist / runtime probe (see\n"
+            f"# docs/SECURITY.md). Kept only so a human can see exactly what\n"
+            f"# the LLM produced without re-running the search.\n\n"
+        )
+        file_path = os.path.join(REJECTED_DIR, f"gen{generation}_cand{k}.py")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(header + code)
+    except OSError as e:
+        logger.warning(
+            "failed to persist rejected candidate source",
+            extra={
+                "event": "rejected_candidate_save_failed",
+                "generation": generation, "candidate": k, "error": str(e),
+            },
+        )
 
 
 def _aggregate_metrics(runs: list[dict]) -> dict:
@@ -211,6 +301,7 @@ def _smoke_test_and_save(
                     "candidate": k, "stage": "smoke_test", "reason": message,
                 },
             )
+            _save_rejected_candidate(code, generation, k, message)
             continue
 
         module_name = f"gen{generation}_cand{k}"
@@ -564,6 +655,7 @@ def main():
             f"got {MULTI_OBJECTIVE_MODE!r}"
         )
     os.makedirs(CANDIDATES_DIR, exist_ok=True)
+    _clear_stale_candidate_files()
     telemetry = Telemetry()
     _log_banner()
 
@@ -830,6 +922,19 @@ def main():
         telemetry.record("plots_saved", path=plot_path)
     except Exception as e:
         logger.warning("failed to generate run plots", extra={"event": "plots_failed", "reason": str(e)})
+
+    # P2 fix: print the full ranked final archive to console. Previously the
+    # only end-of-run output was the "EUREKA run finished (duration)" line
+    # below, with the winner's module/fitness/metrics passed via `extra=`
+    # but silently dropped by the console formatter - a human had to open
+    # eureka_log.json and manually find the representative_id inside
+    # final_archive to answer "so which one won?". This prints every
+    # archive member (not just the winner) ranked by diagnostic fitness,
+    # with the actual representative clearly marked.
+    print_final_archive_table(
+        pareto_archive,
+        representative_id=best.get("candidate_id") if best else None,
+    )
 
     if best is None:
         logger.warning("run finished with no successful candidate", extra={"event": "run_empty"})

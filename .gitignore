@@ -2,6 +2,7 @@ groq_keys.json
 checkpoints/
 eureka/checkpoints/
 eureka/candidates/gen*.py
+eureka/candidates/rejected/
 eureka/eureka_log.json
 eureka/eureka_metrics.jsonl
 *.pt

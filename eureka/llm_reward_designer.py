@@ -51,6 +51,13 @@ Constraints:
   statements (no `import math`, no `from ... import ...`, no numpy)
 - Do NOT define any inner/nested function (no `def` inside `shaping_reward`).
   Use inline expressions, comprehensions, or extra local variables instead.
+- Do NOT use `lambda` expressions anywhere in the function (e.g. no
+  `key=lambda v: v.speed` inside `sorted(...)`, no `f = lambda: ...`). The
+  sandbox's AST allowlist rejects lambdas outright - a candidate containing
+  one is discarded before it is ever trained, wasting an entire generation
+  slot. Use a `sorted(..., key=...)` call with a plain function name, a
+  generator expression, a comprehension, or an ordinary loop with named
+  local variables instead.
 - If you apply a transformation (e.g. math.exp, math.tanh, a sigmoid-like
   squashing, or any function with a tunable scale/steepness constant) to
   a reward term, expose that constant as a locally-assigned named

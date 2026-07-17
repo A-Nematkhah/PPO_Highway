@@ -135,6 +135,58 @@ class TrainProgressTable:
         sys.stdout.flush()
 
 
+def print_final_archive_table(archive: list[dict], representative_id: str | None) -> None:
+    """
+    Print a ranked, human-readable summary of the FULL final Pareto archive
+    at the end of a run - not just the single "winner".
+
+    Previously the only end-of-run console output was the duration on the
+    "EUREKA run finished" line; every candidate's actual crash/speed/overtake
+    trade-off (and even which one was picked as the representative) only
+    existed in eureka_log.json, requiring the user to open and manually
+    reconstruct it from JSON to answer "so which one won?". This prints the
+    same information the archive already carries, sorted by the diagnostic
+    legacy_fitness (see eureka/fitness.py for why that score is diagnostic-
+    only, not a substitute for the Pareto trade-off itself - all three raw
+    metrics are shown side by side specifically so a human isn't limited to
+    that one scalar).
+
+    Safe to call with an empty archive (prints a short "no archive" notice
+    instead of an empty table).
+    """
+    if not archive:
+        sys.stdout.write("\n  Final Pareto archive: empty (no candidate survived the whole run)\n")
+        sys.stdout.flush()
+        return
+
+    ranked = sorted(archive, key=lambda c: c.get("legacy_fitness", c.get("fitness", 0.0)), reverse=True)
+
+    lines = [
+        "",
+        f"  Final Pareto archive ({len(ranked)} candidates)",
+        "  rank  candidate                  crash   speed   otk    fitness",
+        "  ----  ------------------------- ------  ------  -----  -------",
+    ]
+    for candidate in ranked:
+        module_path = str(candidate.get("module_path", "?"))
+        short_name = module_path.rsplit(".", 1)[-1]
+        is_rep = candidate.get("candidate_id") == representative_id
+        label = f"{short_name} (WINNER)" if is_rep else short_name
+        metrics = candidate.get("metrics", {})
+        fitness = candidate.get("legacy_fitness", candidate.get("fitness", float("nan")))
+        rank = candidate.get("pareto_rank", "?")
+        lines.append(
+            f"   {str(rank):>3}  {label:<27}"
+            f"{_fmt_num(float(metrics.get('crash_rate', float('nan'))) * 100, 5, 1)}% "
+            f"{_fmt_num(metrics.get('mean_speed', float('nan')), 6, 1)} "
+            f"{_fmt_num(metrics.get('mean_overtakes', float('nan')), 5, 2)}  "
+            f"{_fmt_num(fitness, 6, 3)}"
+        )
+    lines.append("")
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
 def _format_context(record: logging.LogRecord) -> str:
     event = getattr(record, "event", None)
     data = _extract_extras(record)
