@@ -24,6 +24,8 @@ import multiprocessing as mp
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Optional
 
 from eureka.eureka_config import (
     CONFIRMATION_SEEDS,
@@ -49,7 +51,7 @@ from eureka.eureka_config import (
 from eureka.evaluate_candidate import evaluate_candidate
 from eureka.fitness import compute_fitness
 from eureka.llm_reward_designer import generate_candidates
-from eureka.logging_utils import get_logger, print_final_archive_table
+from eureka.logging_utils import get_logger
 from eureka.objectives import (
     annotate_population,
     candidate_id,
@@ -59,12 +61,11 @@ from eureka.objectives import (
 )
 from eureka.smoke_test import smoke_test
 from eureka.telemetry import Telemetry
-from eureka.train_candidate import train_candidate
+from eureka.train_candidate import component_sidecar_path, train_candidate
 
 logger = get_logger(__name__)
 
 CANDIDATES_DIR = os.path.join("eureka", "candidates")
-REJECTED_DIR = os.path.join(CANDIDATES_DIR, "rejected")
 LOG_PATH = os.path.join("eureka", "eureka_log.json")
 PLOTS_DIR = os.path.join("eureka", "plots")
 
@@ -90,95 +91,6 @@ def _log_banner():
     )
 
 
-def _clear_stale_candidate_files() -> None:
-    """
-    Remove leftover gen*.py files from a PREVIOUS run before this run starts.
-
-    Candidate source files are only written to CANDIDATES_DIR when a
-    candidate passes the smoke test (see _smoke_test_and_save); a candidate
-    that fails smoke test THIS run is simply skipped, which means whatever
-    file happened to occupy that gen{N}_cand{k}.py path from an earlier,
-    successful run is left sitting there completely untouched by this run.
-    Nothing in the training/eval pipeline actually loads a stale file by
-    mistake - env_factory.py only ever loads module_paths that THIS run's
-    survivors list explicitly names - but it is a real footgun for a human
-    debugging a run from the filesystem: eureka/candidates/gen0_cand3.py
-    can silently be leftover code from three runs ago, with no indication
-    that this run's candidate 3 was actually rejected and never wrote
-    anything there. (Observed directly: a run that rejected candidates
-    1/2/3/5 for nested-function/getattr/lambda violations left the
-    PREVIOUS run's valid cand1/2/3/5 sitting on disk, making it look like
-    those were the rejected candidates when inspected afterward.)
-
-    Called once at the start of main() so every run starts from a clean
-    CANDIDATES_DIR - only files THIS run's survivors actually produce will
-    exist in it afterward. Rejected candidates' source is preserved
-    separately under REJECTED_DIR (see _save_rejected_candidate) so
-    debugging a rejection doesn't require re-running the whole search.
-    """
-    if os.path.isdir(CANDIDATES_DIR):
-        for name in os.listdir(CANDIDATES_DIR):
-            if name.startswith("gen") and name.endswith(".py"):
-                try:
-                    os.remove(os.path.join(CANDIDATES_DIR, name))
-                except OSError as e:
-                    logger.warning(
-                        "failed to remove stale candidate file",
-                        extra={"event": "stale_candidate_cleanup_failed", "path": name, "error": str(e)},
-                    )
-
-    if os.path.isdir(REJECTED_DIR):
-        for name in os.listdir(REJECTED_DIR):
-            if name.endswith(".py"):
-                try:
-                    os.remove(os.path.join(REJECTED_DIR, name))
-                except OSError as e:
-                    logger.warning(
-                        "failed to remove stale rejected-candidate file",
-                        extra={"event": "stale_candidate_cleanup_failed", "path": name, "error": str(e)},
-                    )
-
-
-def _save_rejected_candidate(code: str, generation: int, k: int, reason: str) -> None:
-    """
-    Persist a smoke-test-rejected candidate's EXACT source under
-    REJECTED_DIR with the rejection reason as a header comment, so a human
-    can inspect WHY the sandbox rejected it without re-running the search.
-    Previously the log line only ever recorded the reason string ("disallowed
-    syntax: Lambda", "call to 'getattr' is not allowed", ...) - the actual
-    generated code that triggered it was discarded entirely, making the
-    rejection impossible to debug or feed back into prompt-engineering
-    after the fact.
-
-    Purely a debugging aid: REJECTED_DIR is never imported or exec'd by
-    anything in the pipeline (eureka.sandbox only ever loads a candidate by
-    the module_path recorded for THIS run's survivors, and rejected
-    candidates never become survivors), so writing here cannot affect
-    training, evaluation, or which code actually runs.
-    """
-    try:
-        os.makedirs(REJECTED_DIR, exist_ok=True)
-        header = (
-            f"# REJECTED - generation={generation} candidate={k}\n"
-            f"# reason: {reason}\n"
-            f"# This file was never loaded, exec'd, or trained - it failed\n"
-            f"# eureka/sandbox.py's AST allowlist / runtime probe (see\n"
-            f"# docs/SECURITY.md). Kept only so a human can see exactly what\n"
-            f"# the LLM produced without re-running the search.\n\n"
-        )
-        file_path = os.path.join(REJECTED_DIR, f"gen{generation}_cand{k}.py")
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(header + code)
-    except OSError as e:
-        logger.warning(
-            "failed to persist rejected candidate source",
-            extra={
-                "event": "rejected_candidate_save_failed",
-                "generation": generation, "candidate": k, "error": str(e),
-            },
-        )
-
-
 def _aggregate_metrics(runs: list[dict]) -> dict:
     keys = ("crash_rate", "mean_speed", "mean_overtakes", "mean_raw_return")
     return {
@@ -197,6 +109,39 @@ def _json_safe(value):
     return value
 
 
+def _load_component_history(short_name: str, generation: int, k: int) -> dict | None:
+    """
+    Best-effort read of a candidate's component-history sidecar (written by
+    train_candidate.py). Returns None on any missing/unreadable/corrupt
+    file - deliberately NOT re-raised to the caller's training try/except.
+
+    component_history is purely diagnostic (LLM reflection context, see
+    reflection.py); it must never be able to reject an otherwise
+    successfully-trained-and-checkpointed candidate. Before this helper
+    existed, a corrupt sidecar's json.JSONDecodeError propagated out of the
+    same try/except that wraps train_candidate() itself, so a bad sidecar
+    silently discarded a good checkpoint - see
+    eureka/tests/test_component_sidecar.py::test_corrupt_component_sidecar_does_not_abort_loop.
+    """
+    path = component_sidecar_path(short_name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            sidecar = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(
+            "component sidecar unreadable, continuing without component_history",
+            extra={
+                "event": "component_sidecar_read_failed",
+                "generation": generation, "candidate": k, "path": path, "reason": str(e),
+            },
+        )
+        return None
+    history = sidecar.get("component_history") or {}
+    return history or None
+
+
 def _pin_worker_threads() -> None:
     threads = str(max(1, TORCH_THREADS_PER_WORKER))
     os.environ["OMP_NUM_THREADS"] = threads
@@ -211,27 +156,25 @@ def _run_candidate_worker(job: dict) -> dict:
     from eureka.train_candidate import train_candidate as _train_candidate
 
     start = time.perf_counter()
-    checkpoint_path = None
-    component_history = None
 
     try:
         checkpoint_path = _train_candidate(
             job["module_path"], total_timesteps=job["total_timesteps"], seed=job["seed"],
         )
-        components_sidecar = os.path.join(
-            "eureka", "checkpoints", f"{job['module_path'].split('.')[-1]}_components.json"
-        )
-        if os.path.isfile(components_sidecar):
-            with open(components_sidecar, encoding="utf-8") as f:
-                sidecar = json.load(f)
-            history = sidecar.get("component_history") or {}
-            if history:
-                component_history = history
     except Exception as e:
         return {
             "k": job["k"], "stage": "train", "error": str(e),
             "duration_s": round(time.perf_counter() - start, 4),
         }
+
+    # Deliberately its own try/except via _load_component_history, NOT
+    # folded into the training try/except above: a corrupt sidecar is
+    # diagnostic-data-only and must never discard an otherwise
+    # successfully-trained checkpoint (see _load_component_history's
+    # docstring and test_component_sidecar.py).
+    component_history = _load_component_history(
+        job["module_path"].split(".")[-1], job.get("generation", -1), job["k"]
+    )
 
     try:
         metrics = _evaluate_candidate(checkpoint_path, job["module_path"], n_episodes=job["n_eval_episodes"])
@@ -301,7 +244,6 @@ def _smoke_test_and_save(
                     "candidate": k, "stage": "smoke_test", "reason": message,
                 },
             )
-            _save_rejected_candidate(code, generation, k, message)
             continue
 
         module_name = f"gen{generation}_cand{k}"
@@ -387,18 +329,14 @@ def _train_and_evaluate_sequential(
                     seed=candidate_base_seed(generation, k),
                 )
                 train_ctx["checkpoint"] = checkpoint_path
-            components_sidecar = os.path.join(
-                "eureka", "checkpoints", f"gen{generation}_cand{k}_components.json"
-            )
-            if os.path.isfile(components_sidecar):
-                with open(components_sidecar, encoding="utf-8") as f:
-                    sidecar = json.load(f)
-                history = sidecar.get("component_history") or {}
-                if history:
-                    component_history = history
         except Exception as e:
             _log_candidate_rejected(generation, k, "train", str(e))
             continue
+
+        # Deliberately OUTSIDE the training try/except above: this is
+        # diagnostic-only data (see _load_component_history docstring) and
+        # must never cause a successfully-trained candidate to be rejected.
+        component_history = _load_component_history(f"gen{generation}_cand{k}", generation, k)
 
         try:
             with telemetry.timed("eval", generation=generation, candidate=k, module_path=survivor["module_path"]) as eval_ctx:
@@ -422,6 +360,7 @@ def _train_and_evaluate_parallel(
     jobs = [
         {
             "k": s["k"],
+            "generation": generation,
             "module_path": s["module_path"],
             "seed": candidate_base_seed(generation, s["k"]),
             "total_timesteps": TRAIN_STEPS_PER_CANDIDATE,
@@ -648,6 +587,291 @@ def _confirm_archive(archive: list[dict], telemetry: Telemetry) -> list[dict]:
     return update_archive([], confirmed, OBJECTIVE_SPECS, PARETO_ARCHIVE_SIZE)
 
 
+def _record_empty_generation(
+    generation: int, pareto_archive: list[dict], full_log: list[dict],
+    telemetry: Telemetry, gen_start: float,
+) -> None:
+    """
+    Records a generation where the LLM returned zero usable candidates
+    (e.g. every call failed with RequestTooLargeError even after the one
+    retry in generate_candidates, or every response was unparseable).
+
+    Escalated to ERROR-level plus a dedicated telemetry event (distinct
+    from the generic "generation_complete" row) so a run silently losing a
+    third of its search budget to LLM failures is impossible to miss in an
+    hours-long log - `grep generation_all_candidates_failed` finds it
+    immediately instead of requiring someone to notice the archive ended
+    up smaller than expected.
+    """
+    logger.error(
+        "ALL LLM CANDIDATES FAILED THIS GENERATION - generation "
+        "budget lost entirely (check llm_call_error / "
+        "llm_call_request_too_large events above for the cause)",
+        extra={
+            "event": "generation_all_candidates_failed",
+            "generation": generation,
+            "k_requested": K_CANDIDATES,
+        },
+    )
+    telemetry.record(
+        "generation_all_candidates_failed",
+        generation=generation,
+        k_requested=K_CANDIDATES,
+    )
+    full_log.append({
+        "generation": generation,
+        "results": [],
+        "pareto_front_size": sum(item.get("pareto_rank") == 0 for item in pareto_archive),
+        "archive_size": len(pareto_archive),
+        "selection_mode": MULTI_OBJECTIVE_MODE,
+        "all_candidates_failed": True,
+    })
+    telemetry.record(
+        "generation_complete",
+        generation=generation,
+        duration_s=round(time.perf_counter() - gen_start, 4),
+        n_results=0,
+    )
+
+
+def _record_generation_with_no_survivors(
+    generation: int, pareto_archive: list[dict], full_log: list[dict],
+    telemetry: Telemetry, gen_duration: float,
+) -> None:
+    """Records a generation where the LLM returned candidates, but every one
+    was rejected by the smoke test / training / evaluation."""
+    full_log.append({
+        "generation": generation,
+        "results": [],
+        "pareto_front_size": sum(item.get("pareto_rank") == 0 for item in pareto_archive),
+        "archive_size": len(pareto_archive),
+        "selection_mode": MULTI_OBJECTIVE_MODE,
+    })
+    telemetry.record(
+        "generation_complete",
+        generation=generation,
+        duration_s=gen_duration,
+        n_results=0,
+        archive_size=len(pareto_archive),
+    )
+    logger.warning(
+        "all candidates rejected this generation",
+        extra={"event": "generation_empty", "generation": generation},
+    )
+
+
+@dataclass
+class GenerationOutcome:
+    """What main()'s generation loop needs back after a successful
+    generation: the updated cross-generation archive plus the two
+    candidates for "best" (legacy scalar winner and Pareto representative)
+    - main() picks between them based on MULTI_OBJECTIVE_MODE."""
+
+    pareto_archive: list[dict]
+    generation_best: dict
+    representative: Optional[dict]
+
+
+def _finalize_successful_generation(
+    generation: int,
+    generation_results: list[dict],
+    pareto_archive: list[dict],
+    full_log: list[dict],
+    telemetry: Telemetry,
+    gen_duration: float,
+) -> GenerationOutcome:
+    """
+    Pareto-ranks this generation's results, re-screens its front on a
+    second seed, merges it into the cross-generation archive, builds and
+    appends the generation's full_log record, and emits the
+    generation_complete / generation_selection log+telemetry events.
+
+    This is the "happy path" body of the per-generation loop in main() -
+    split out because it was, by a wide margin, the single longest and
+    most deeply-nested block in the whole module (originally ~115 lines
+    inline). Splitting it doesn't change any of its logic or ordering,
+    only where it lives.
+    """
+    generation_fronts = annotate_population(generation_results, OBJECTIVE_SPECS)
+
+    # Re-screen this generation's front on a second independent seed
+    # BEFORE it is locked into the cross-generation archive or used to
+    # pick the legacy scalar winner - otherwise a genuinely good
+    # candidate can be evicted purely from single-seed noise before
+    # CONFIRMATION_SEEDS (which only runs at the very end) ever gets a
+    # chance to re-check it.
+    generation_results = _screen_confirm_front(
+        generation_results, generation_fronts[0], generation, telemetry
+    )
+    generation_fronts = annotate_population(generation_results, OBJECTIVE_SPECS)
+    generation_front_ids = [
+        generation_results[index]["candidate_id"]
+        for index in generation_fronts[0]
+    ]
+    generation_best = max(generation_results, key=lambda r: r["fitness"])
+    scalar_winner_on_front = generation_best["candidate_id"] in generation_front_ids
+
+    pareto_archive = update_archive(
+        pareto_archive,
+        generation_results,
+        OBJECTIVE_SPECS,
+        PARETO_ARCHIVE_SIZE,
+    )
+    archive_by_id = {candidate["candidate_id"]: candidate for candidate in pareto_archive}
+    for result in generation_results:
+        archived = archive_by_id.get(result["candidate_id"])
+        result["archive_member"] = archived is not None
+        result["archive_pareto_rank"] = archived["pareto_rank"] if archived is not None else None
+        result["archive_crowding_distance"] = (
+            archived["crowding_distance"] if archived is not None else None
+        )
+    representative = select_representative(pareto_archive, OBJECTIVE_SPECS)
+    pareto_front_size = sum(candidate.get("pareto_rank") == 0 for candidate in pareto_archive)
+
+    generation_record = {
+        "generation": generation,
+        "results": generation_results,
+        "selection_mode": MULTI_OBJECTIVE_MODE,
+        "pareto_front_size": pareto_front_size,
+        "archive_size": len(pareto_archive),
+        "archive_candidate_ids": [candidate["candidate_id"] for candidate in pareto_archive],
+        "generation_front_candidate_ids": generation_front_ids,
+        "legacy_scalar_winner_id": generation_best["candidate_id"],
+        "legacy_scalar_winner_on_front": scalar_winner_on_front,
+        "representative_id": representative["candidate_id"] if representative else None,
+        "objective_specs": OBJECTIVE_SPECS,
+    }
+    full_log.append(generation_record)
+
+    telemetry.record(
+        "generation_complete",
+        generation=generation,
+        duration_s=gen_duration,
+        n_results=len(generation_results),
+        selection_mode=MULTI_OBJECTIVE_MODE,
+        pareto_front_size=pareto_front_size,
+        archive_size=len(pareto_archive),
+        rank_distribution={
+            str(rank): sum(candidate.get("pareto_rank") == rank for candidate in pareto_archive)
+            for rank in sorted({candidate.get("pareto_rank") for candidate in pareto_archive})
+        },
+        scalar_winner_on_front=scalar_winner_on_front,
+    )
+
+    logger.info(
+        "generation selection complete",
+        extra={
+            "event": "generation_selection",
+            "generation": generation,
+            "selection_mode": MULTI_OBJECTIVE_MODE,
+            "legacy_fitness": generation_best["fitness"],
+            "legacy_winner": generation_best["module_path"],
+            "legacy_winner_on_front": scalar_winner_on_front,
+            "pareto_front_size": pareto_front_size,
+            "archive_size": len(pareto_archive),
+            "representative": representative["module_path"] if representative else None,
+            "duration_s": gen_duration,
+        },
+    )
+
+    return GenerationOutcome(
+        pareto_archive=pareto_archive,
+        generation_best=generation_best,
+        representative=representative,
+    )
+
+
+def _finalize_run(
+    pareto_archive: list[dict],
+    full_log: list[dict],
+    telemetry: Telemetry,
+    best: Optional[dict],
+    run_start: float,
+    empty_generations: list[int],
+) -> None:
+    """
+    Everything that happens once the generation loop is done: multi-seed
+    confirmation of the final archive, writing the final log, the
+    end-of-run plot, and the final summary log lines (including the
+    impossible-to-miss warning when one or more generations lost their
+    entire LLM candidate budget).
+    """
+    pareto_archive = _confirm_archive(pareto_archive, telemetry)
+    representative = select_representative(pareto_archive, OBJECTIVE_SPECS)
+    if MULTI_OBJECTIVE_MODE == "pareto":
+        best = representative
+    if full_log:
+        full_log[-1]["final_archive"] = pareto_archive
+        with open(LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(_json_safe(full_log), f, indent=2, default=str, allow_nan=False)
+
+    total_duration = round(time.perf_counter() - run_start, 4)
+
+    telemetry.record(
+        "run_complete",
+        duration_s=total_duration,
+        had_best=best is not None,
+        selection_mode=MULTI_OBJECTIVE_MODE,
+        archive_size=len(pareto_archive),
+        pareto_front_size=sum(candidate.get("pareto_rank") == 0 for candidate in pareto_archive),
+        pareto_front=[
+            {
+                "candidate_id": candidate["candidate_id"],
+                "module_path": candidate["module_path"],
+                "metrics": candidate["metrics"],
+            }
+            for candidate in pareto_archive
+            if candidate.get("pareto_rank") == 0
+        ],
+        empty_generations=empty_generations,
+    )
+
+    try:
+        from eureka.plots import generate_run_plots
+        plot_path = generate_run_plots(full_log, pareto_archive, PLOTS_DIR)
+        logger.info("run plots saved", extra={"event": "plots_saved", "path": plot_path})
+        telemetry.record("plots_saved", path=plot_path)
+    except Exception as e:
+        logger.warning("failed to generate run plots", extra={"event": "plots_failed", "reason": str(e)})
+
+    if best is None:
+        logger.warning("run finished with no successful candidate", extra={"event": "run_empty"})
+        return
+
+    # A run can "finish" with a usable archive while still having silently
+    # lost one or more generations to LLM failures. Surface that loudly in
+    # the final summary log line instead of requiring someone to grep the
+    # whole run for generation_all_candidates_failed.
+    logger.info(
+        "EUREKA run finished",
+        extra={
+            "event": "run_complete",
+            "duration_s": total_duration,
+            "selection_mode": MULTI_OBJECTIVE_MODE,
+            "representative_module": best["module_path"],
+            "representative_checkpoint": best["checkpoint"],
+            "representative_metrics": best["metrics"],
+            "legacy_fitness": best.get("fitness"),
+            "pareto_front_size": sum(candidate.get("pareto_rank") == 0 for candidate in pareto_archive),
+            "archive_size": len(pareto_archive),
+            "generations_with_zero_candidates": empty_generations,
+        },
+    )
+    if empty_generations:
+        logger.error(
+            f"RUN COMPLETED BUT {len(empty_generations)}/{N_GENERATIONS} "
+            f"GENERATIONS RETURNED ZERO CANDIDATES (generations: "
+            f"{empty_generations}) - search budget was silently reduced; "
+            "see generation_all_candidates_failed events above",
+            extra={
+                "event": "run_completed_with_empty_generations",
+                "empty_generation_count": len(empty_generations),
+                "total_generations": N_GENERATIONS,
+                "empty_generations": empty_generations,
+            },
+        )
+
+
 def main():
     if MULTI_OBJECTIVE_MODE not in {"shadow", "pareto"}:
         raise ValueError(
@@ -655,21 +879,19 @@ def main():
             f"got {MULTI_OBJECTIVE_MODE!r}"
         )
     os.makedirs(CANDIDATES_DIR, exist_ok=True)
-    _clear_stale_candidate_files()
     telemetry = Telemetry()
     _log_banner()
 
     best = None
-    pareto_archive = []
-    full_log = []
+    pareto_archive: list[dict] = []
+    full_log: list[dict] = []
     run_start = time.perf_counter()
-    # P1 fix: track how many generations returned zero candidates from the
-    # LLM (e.g. every call failed with RequestTooLargeError even after the
-    # one retry in generate_candidates, or every response was unparseable).
-    # Previously this was only a single WARNING line per occurrence, easy to
-    # miss in an hours-long log — a run could silently lose a third of its
-    # search budget with nothing surfacing that fact until someone happened
-    # to notice the archive was smaller than expected.
+    # Tracks how many generations returned zero candidates from the LLM
+    # (e.g. every call failed with RequestTooLargeError even after the one
+    # retry in generate_candidates, or every response was unparseable) so
+    # a run silently losing part of its search budget is surfaced loudly
+    # at the end instead of requiring someone to notice the archive was
+    # smaller than expected.
     empty_generations: list[int] = []
 
     for generation in range(N_GENERATIONS):
@@ -701,173 +923,27 @@ def main():
 
         if not candidates_code:
             empty_generations.append(generation)
-            # P1 fix: escalated from a single WARNING to an ERROR-level,
-            # impossible-to-miss log line plus a dedicated telemetry event
-            # (distinct from the generic "generation_complete" row so it's
-            # trivially greppable: `grep generation_all_candidates_failed`).
-            logger.error(
-                "ALL LLM CANDIDATES FAILED THIS GENERATION - generation "
-                "budget lost entirely (check llm_call_error / "
-                "llm_call_request_too_large events above for the cause)",
-                extra={
-                    "event": "generation_all_candidates_failed",
-                    "generation": generation,
-                    "k_requested": K_CANDIDATES,
-                },
-            )
-            telemetry.record(
-                "generation_all_candidates_failed",
-                generation=generation,
-                k_requested=K_CANDIDATES,
-            )
-            full_log.append({
-                "generation": generation,
-                "results": [],
-                "pareto_front_size": sum(
-                    item.get("pareto_rank") == 0 for item in pareto_archive
-                ),
-                "archive_size": len(pareto_archive),
-                "selection_mode": MULTI_OBJECTIVE_MODE,
-                "all_candidates_failed": True,
-            })
-            telemetry.record(
-                "generation_complete",
-                generation=generation,
-                duration_s=round(time.perf_counter() - gen_start, 4),
-                n_results=0,
-            )
+            _record_empty_generation(generation, pareto_archive, full_log, telemetry, gen_start)
             continue
 
         survivors = _smoke_test_and_save(candidates_code, generation, human_seed_index, telemetry)
         generation_results = _train_and_evaluate_generation(survivors, generation, telemetry)
-
         gen_duration = round(time.perf_counter() - gen_start, 4)
 
         if not generation_results:
-            full_log.append({
-                "generation": generation,
-                "results": [],
-                "pareto_front_size": sum(
-                    item.get("pareto_rank") == 0 for item in pareto_archive
-                ),
-                "archive_size": len(pareto_archive),
-                "selection_mode": MULTI_OBJECTIVE_MODE,
-            })
-            telemetry.record(
-                "generation_complete",
-                generation=generation,
-                duration_s=gen_duration,
-                n_results=0,
-                archive_size=len(pareto_archive),
-            )
-            logger.warning(
-                "all candidates rejected this generation",
-                extra={"event": "generation_empty", "generation": generation},
+            _record_generation_with_no_survivors(
+                generation, pareto_archive, full_log, telemetry, gen_duration
             )
             continue
 
-        generation_fronts = annotate_population(generation_results, OBJECTIVE_SPECS)
-
-        # Re-screen this generation's front on a second independent seed
-        # BEFORE it is locked into the cross-generation archive or used to
-        # pick the legacy scalar winner - otherwise a genuinely good
-        # candidate can be evicted purely from single-seed noise before
-        # CONFIRMATION_SEEDS (which only runs at the very end) ever gets a
-        # chance to re-check it.
-        generation_results = _screen_confirm_front(
-            generation_results, generation_fronts[0], generation, telemetry
+        outcome = _finalize_successful_generation(
+            generation, generation_results, pareto_archive, full_log, telemetry, gen_duration,
         )
-        generation_fronts = annotate_population(generation_results, OBJECTIVE_SPECS)
-        generation_front_ids = [
-            generation_results[index]["candidate_id"]
-            for index in generation_fronts[0]
-        ]
-        generation_best = max(generation_results, key=lambda r: r["fitness"])
-        scalar_winner_on_front = generation_best["candidate_id"] in generation_front_ids
-
-        pareto_archive = update_archive(
-            pareto_archive,
-            generation_results,
-            OBJECTIVE_SPECS,
-            PARETO_ARCHIVE_SIZE,
-        )
-        archive_by_id = {
-            candidate["candidate_id"]: candidate for candidate in pareto_archive
-        }
-        for result in generation_results:
-            archived = archive_by_id.get(result["candidate_id"])
-            result["archive_member"] = archived is not None
-            result["archive_pareto_rank"] = (
-                archived["pareto_rank"] if archived is not None else None
-            )
-            result["archive_crowding_distance"] = (
-                archived["crowding_distance"] if archived is not None else None
-            )
-        representative = select_representative(pareto_archive, OBJECTIVE_SPECS)
-        pareto_front_size = sum(
-            candidate.get("pareto_rank") == 0 for candidate in pareto_archive
-        )
-
-        generation_record = {
-            "generation": generation,
-            "results": generation_results,
-            "selection_mode": MULTI_OBJECTIVE_MODE,
-            "pareto_front_size": pareto_front_size,
-            "archive_size": len(pareto_archive),
-            "archive_candidate_ids": [
-                candidate["candidate_id"] for candidate in pareto_archive
-            ],
-            "generation_front_candidate_ids": generation_front_ids,
-            "legacy_scalar_winner_id": generation_best["candidate_id"],
-            "legacy_scalar_winner_on_front": scalar_winner_on_front,
-            "representative_id": (
-                representative["candidate_id"] if representative else None
-            ),
-            "objective_specs": OBJECTIVE_SPECS,
-        }
-        full_log.append(generation_record)
-
-        telemetry.record(
-            "generation_complete",
-            generation=generation,
-            duration_s=gen_duration,
-            n_results=len(generation_results),
-            selection_mode=MULTI_OBJECTIVE_MODE,
-            pareto_front_size=pareto_front_size,
-            archive_size=len(pareto_archive),
-            rank_distribution={
-                str(rank): sum(
-                    candidate.get("pareto_rank") == rank
-                    for candidate in pareto_archive
-                )
-                for rank in sorted({
-                    candidate.get("pareto_rank") for candidate in pareto_archive
-                })
-            },
-            scalar_winner_on_front=scalar_winner_on_front,
-        )
-
-        logger.info(
-            "generation selection complete",
-            extra={
-                "event": "generation_selection",
-                "generation": generation,
-                "selection_mode": MULTI_OBJECTIVE_MODE,
-                "legacy_fitness": generation_best["fitness"],
-                "legacy_winner": generation_best["module_path"],
-                "legacy_winner_on_front": scalar_winner_on_front,
-                "pareto_front_size": pareto_front_size,
-                "archive_size": len(pareto_archive),
-                "representative": (
-                    representative["module_path"] if representative else None
-                ),
-                "duration_s": gen_duration,
-            },
-        )
+        pareto_archive = outcome.pareto_archive
 
         if MULTI_OBJECTIVE_MODE == "shadow":
-            if best is None or generation_best["fitness"] > best["fitness"]:
-                best = generation_best
+            if best is None or outcome.generation_best["fitness"] > best["fitness"]:
+                best = outcome.generation_best
                 logger.info(
                     "new legacy scalar best (shadow mode)",
                     extra={
@@ -877,103 +953,13 @@ def main():
                     },
                 )
         else:
-            best = representative
+            best = outcome.representative
 
         with open(LOG_PATH, "w", encoding="utf-8") as f:
             json.dump(_json_safe(full_log), f, indent=2, default=str, allow_nan=False)
         logger.info("log updated", extra={"event": "log_write", "path": LOG_PATH})
 
-    pareto_archive = _confirm_archive(pareto_archive, telemetry)
-    representative = select_representative(pareto_archive, OBJECTIVE_SPECS)
-    if MULTI_OBJECTIVE_MODE == "pareto":
-        best = representative
-    if full_log:
-        full_log[-1]["final_archive"] = pareto_archive
-        with open(LOG_PATH, "w", encoding="utf-8") as f:
-            json.dump(_json_safe(full_log), f, indent=2, default=str, allow_nan=False)
-
-    total_duration = round(time.perf_counter() - run_start, 4)
-
-    telemetry.record(
-        "run_complete",
-        duration_s=total_duration,
-        had_best=best is not None,
-        selection_mode=MULTI_OBJECTIVE_MODE,
-        archive_size=len(pareto_archive),
-        pareto_front_size=sum(
-            candidate.get("pareto_rank") == 0 for candidate in pareto_archive
-        ),
-        pareto_front=[
-            {
-                "candidate_id": candidate["candidate_id"],
-                "module_path": candidate["module_path"],
-                "metrics": candidate["metrics"],
-            }
-            for candidate in pareto_archive
-            if candidate.get("pareto_rank") == 0
-        ],
-        empty_generations=empty_generations,
-    )
-
-    try:
-        from eureka.plots import generate_run_plots
-        plot_path = generate_run_plots(full_log, pareto_archive, PLOTS_DIR)
-        logger.info("run plots saved", extra={"event": "plots_saved", "path": plot_path})
-        telemetry.record("plots_saved", path=plot_path)
-    except Exception as e:
-        logger.warning("failed to generate run plots", extra={"event": "plots_failed", "reason": str(e)})
-
-    # P2 fix: print the full ranked final archive to console. Previously the
-    # only end-of-run output was the "EUREKA run finished (duration)" line
-    # below, with the winner's module/fitness/metrics passed via `extra=`
-    # but silently dropped by the console formatter - a human had to open
-    # eureka_log.json and manually find the representative_id inside
-    # final_archive to answer "so which one won?". This prints every
-    # archive member (not just the winner) ranked by diagnostic fitness,
-    # with the actual representative clearly marked.
-    print_final_archive_table(
-        pareto_archive,
-        representative_id=best.get("candidate_id") if best else None,
-    )
-
-    if best is None:
-        logger.warning("run finished with no successful candidate", extra={"event": "run_empty"})
-        return
-
-    # P1 fix: a run can "finish" with a usable archive while still having
-    # silently lost one or more generations to LLM failures. Surface that
-    # loudly in the final summary log line instead of requiring someone to
-    # grep the whole run for generation_all_candidates_failed.
-    logger.info(
-        "EUREKA run finished",
-        extra={
-            "event": "run_complete",
-            "duration_s": total_duration,
-            "selection_mode": MULTI_OBJECTIVE_MODE,
-            "representative_module": best["module_path"],
-            "representative_checkpoint": best["checkpoint"],
-            "representative_metrics": best["metrics"],
-            "legacy_fitness": best.get("fitness"),
-            "pareto_front_size": sum(
-                candidate.get("pareto_rank") == 0 for candidate in pareto_archive
-            ),
-            "archive_size": len(pareto_archive),
-            "generations_with_zero_candidates": empty_generations,
-        },
-    )
-    if empty_generations:
-        logger.error(
-            f"RUN COMPLETED BUT {len(empty_generations)}/{N_GENERATIONS} "
-            f"GENERATIONS RETURNED ZERO CANDIDATES (generations: "
-            f"{empty_generations}) - search budget was silently reduced; "
-            "see generation_all_candidates_failed events above",
-            extra={
-                "event": "run_completed_with_empty_generations",
-                "empty_generation_count": len(empty_generations),
-                "total_generations": N_GENERATIONS,
-                "empty_generations": empty_generations,
-            },
-        )
+    _finalize_run(pareto_archive, full_log, telemetry, best, run_start, empty_generations)
 
 
 if __name__ == "__main__":

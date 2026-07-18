@@ -40,14 +40,20 @@ def test_call_shaping_fn_returns_value_when_fast():
 
 
 def test_call_shaping_fn_returns_zero_on_timeout(caplog):
+    # caplog.at_level(level, logger=name) already attaches caplog's handler
+    # to that named logger for the duration of the block - this is pytest's
+    # documented workaround for loggers that don't propagate to root (see
+    # eureka.logging_utils.setup_logging(), which sets propagate=False on
+    # the "eureka" logger). Manually addHandler(caplog.handler) here too
+    # would register the SAME handler twice on the SAME logger, so every
+    # record gets appended to caplog.records twice - which is exactly what
+    # was causing this test to intermittently see 2 (or 4, run alongside
+    # test_executor_replaced_after_leak_saturation below) log entries where
+    # only 1 (or 2) actually occurred.
     with caplog.at_level(logging.WARNING, logger="eureka.shaping_call"):
-        sc.logger.addHandler(caplog.handler)
-        try:
-            value, components = call_shaping_fn(
-                _slow_fn, None, None, {}, timeout_s=0.05
-            )
-        finally:
-            sc.logger.removeHandler(caplog.handler)
+        value, components = call_shaping_fn(
+            _slow_fn, None, None, {}, timeout_s=0.05
+        )
     assert value == 0.0
     assert components == {}
     timeout_logs = [
@@ -97,16 +103,16 @@ def test_call_shaping_fn_degrades_malformed_tuple():
 def test_executor_replaced_after_leak_saturation(monkeypatch, caplog):
     monkeypatch.setattr(sc, "_max_workers", 2)
 
+    # See test_call_shaping_fn_returns_zero_on_timeout above for why the
+    # manual addHandler/removeHandler pair is not needed (and actively
+    # harmful): caplog.at_level(level, logger=...) already attaches its
+    # handler to that logger for the block's duration.
     with caplog.at_level(logging.WARNING, logger="eureka.shaping_call"):
-        sc.logger.addHandler(caplog.handler)
-        try:
-            call_shaping_fn(_hang_fn, None, None, {}, timeout_s=0.01)
-            call_shaping_fn(_hang_fn, None, None, {}, timeout_s=0.01)
-            value, components = call_shaping_fn(
-                _fast_fn, None, None, {"n_overtakes": 4}, timeout_s=0.5
-            )
-        finally:
-            sc.logger.removeHandler(caplog.handler)
+        call_shaping_fn(_hang_fn, None, None, {}, timeout_s=0.01)
+        call_shaping_fn(_hang_fn, None, None, {}, timeout_s=0.01)
+        value, components = call_shaping_fn(
+            _fast_fn, None, None, {"n_overtakes": 4}, timeout_s=0.5
+        )
 
     assert value == pytest.approx(0.4)
     assert components == {}

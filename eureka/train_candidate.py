@@ -33,15 +33,44 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ROLLING_WINDOW = 20
 
 
-def component_sidecar_path(candidate_short_name: str) -> str:
+def component_sidecar_path(candidate_name: str) -> str:
+    """
+    Path to a candidate's component-history sidecar JSON file
+    (eureka/checkpoints/{candidate_name}_components.json).
+
+    Kept as its own function (rather than inlined at each call site) so
+    train_candidate.py and loop.py agree on exactly one path convention -
+    loop.py reads this same file back after training to attach
+    component_history to the candidate's log entry.
+    """
     checkpoint_dir = os.path.join("eureka", "checkpoints")
-    return os.path.join(checkpoint_dir, f"{candidate_short_name}_components.json")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    return os.path.join(checkpoint_dir, f"{candidate_name}_components.json")
 
 
-def _remove_stale_component_sidecar(candidate_short_name: str) -> None:
-    path = component_sidecar_path(candidate_short_name)
+def _remove_stale_component_sidecar(candidate_name: str) -> None:
+    """
+    Remove a stale sidecar file before candidate training begins.
+
+    A prior run of this same candidate module (e.g. a re-run, or a stale
+    checkpoints/ directory reused across experiments) may have left a
+    components sidecar on disk. If THIS run doesn't produce fresh
+    component data (e.g. the candidate uses the legacy bare-float
+    shaping_reward contract with no components), the stale sidecar would
+    otherwise still be picked up by loop.py and silently attributed to
+    this run's reflection feedback. Clearing it up front means "no
+    sidecar after this call" always means "no component data from this
+    run" - never leftover data from a previous one.
+    """
+    path = component_sidecar_path(candidate_name)
     if os.path.isfile(path):
-        os.remove(path)
+        try:
+            os.remove(path)
+        except OSError:
+            logger.warning(
+                "failed to remove stale component sidecar",
+                extra={"event": "component_sidecar_remove_failed", "path": path},
+            )
 
 
 def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> str:
@@ -59,18 +88,8 @@ def train_candidate(module_path: str, total_timesteps: int, seed: int = 0) -> st
     checkpoint_dir = os.path.join("eureka", "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"{short_name}.pt")
-    components_path = os.path.join(checkpoint_dir, f"{short_name}_components.json")
-
-    # A prior run of this same candidate module (e.g. a re-run, or a stale
-    # checkpoints/ directory reused across experiments) may have left a
-    # components sidecar on disk. If THIS run doesn't produce fresh
-    # component data (e.g. the candidate uses the legacy bare-float
-    # shaping_reward contract with no components), the stale sidecar would
-    # otherwise still be picked up by loop.py and silently attributed to
-    # this run's reflection feedback. Clear it up front so "no sidecar"
-    # always means "no component data from this run."
-    if os.path.isfile(components_path):
-        os.remove(components_path)
+    components_path = component_sidecar_path(short_name)
+    _remove_stale_component_sidecar(short_name)
 
     env = make_candidate_vec_env(module_path, n_envs=EUREKA_N_ENVS, seed=seed)
     try:

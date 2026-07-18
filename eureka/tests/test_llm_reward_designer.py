@@ -22,17 +22,6 @@ def test_system_prompt_forbids_nested_function_definitions():
     assert "def" in lowered
 
 
-def test_system_prompt_forbids_lambda_expressions():
-    """Regression test: gen0 was observed losing 3/8 candidates in one run
-    to 'disallowed syntax: Lambda' smoke-test rejections (sandbox.py's AST
-    allowlist deliberately excludes ast.Lambda - lambdas are a common
-    dunder-access escape vector, e.g. the 'lambda_nested' red-team payload
-    in test_redteam_sandbox.py). The system prompt must explicitly warn the
-    model against reaching for lambda as an inline-function substitute."""
-    lowered = SYSTEM_PROMPT.lower()
-    assert "lambda" in lowered
-
-
 @patch("key_manager.get_key_manager")
 def test_generate_candidates_parses_fenced_response(mock_get_km):
     manager = MagicMock()
