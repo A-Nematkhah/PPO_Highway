@@ -37,10 +37,22 @@ Run the search (this immediately starts generation 0 — there is no `--help` fl
 python -m eureka.loop
 ```
 
+Every invocation creates its own numbered directory under `runs/`
+(`runs/run_0001/`, `runs/run_0002/`, ...) containing that run's
+`config.json`, `metadata.json` (git commit, hardware, timing), `eureka_log.json`,
+`telemetry.jsonl`, three CSV exports, a self-contained `report.html`, archived
+candidate source / reflection prompts / final checkpoints, and a `console.log`
+transcript. Nothing overwrites a previous run. See
+[`eureka/experiment.py`](eureka/experiment.py) for exactly what lives in the
+run directory versus the existing shared `eureka/candidates/` /
+`eureka/checkpoints/` locations (still load-bearing — see its module
+docstring for why those specifically aren't moved).
+
 Other inspectable entrypoints:
 
 ```bash
-python env_utils.py          # print obs/action space shapes
+python env_utils.py                        # print obs/action space shapes
+python -m eureka.evaluate_cli --list       # inspect trained candidates outside the search loop
 python -m pytest eureka/tests/ -m "not integration"
 ```
 
@@ -70,15 +82,22 @@ eureka/
   reflection.py           # multi-elite LLM feedback prompts
   candidate_wrapper.py    # applies LLM shaping each step
   env_factory.py          # picklable candidate env factory
-  logging_utils.py        # structured console (+ optional JSONL)
-  telemetry.py            # eureka_metrics.jsonl
-  candidates/             # generated reward programs (artifacts)
-  checkpoints/            # per-candidate .pt (artifacts)
+  logging_utils.py        # structured console (+ optional JSONL, generation/final-results tables)
+  telemetry.py            # per-run telemetry.jsonl event stream
+  evaluate_cli.py         # standalone CLI: evaluate/render any trained candidate
+  experiment.py           # ExperimentRun: numbered runs/run_NNNN/ directories
+  run_metadata.py         # git/OS/CPU/RAM metadata collection (best-effort)
+  csv_export.py           # pareto_archive / generation_summary / candidate_metrics CSVs
+  report_html.py          # self-contained per-run report.html
+  candidates/             # generated reward programs (live, load-bearing - see sandbox.py)
+  checkpoints/            # per-candidate .pt (live, load-bearing)
   tests/                  # unit + integration tests
 docs/
   PROJECT_ARCHITECTURE.md
   SECURITY.md
   DOC_AUDIT.md
+runs/
+  run_NNNN/                 # one per invocation of `python -m eureka.loop` (see Quick start above)
 ```
 
 ## How the EUREKA loop works

@@ -27,6 +27,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
 
+from eureka.csv_export import export_all
 from eureka.eureka_config import (
     CONFIRMATION_SEEDS,
     EUREKA_N_ENVS,
@@ -49,9 +50,10 @@ from eureka.eureka_config import (
     candidate_base_seed,
 )
 from eureka.evaluate_candidate import evaluate_candidate
+from eureka.experiment import ExperimentRun, build_experiment_config_snapshot
 from eureka.fitness import compute_fitness
-from eureka.llm_reward_designer import generate_candidates
-from eureka.logging_utils import get_logger
+from eureka.llm_reward_designer import REFLECTION_TARGET_ROLES, generate_candidates
+from eureka.logging_utils import get_logger, print_final_results_banner, print_generation_table
 from eureka.objectives import (
     annotate_population,
     candidate_id,
@@ -59,6 +61,9 @@ from eureka.objectives import (
     select_representative,
     update_archive,
 )
+from eureka.reflection import build_reflection
+from eureka.report_html import compute_execution_stats, generate_html_report, generation_reason
+from eureka.run_metadata import collect_run_metadata
 from eureka.smoke_test import smoke_test
 from eureka.telemetry import Telemetry
 from eureka.train_candidate import component_sidecar_path, train_candidate
@@ -66,8 +71,14 @@ from eureka.train_candidate import component_sidecar_path, train_candidate
 logger = get_logger(__name__)
 
 CANDIDATES_DIR = os.path.join("eureka", "candidates")
+# LOG_PATH / PLOTS_DIR: retained as module constants for backward
+# compatibility (anything importing them directly still gets a sensible
+# value), but main() no longer writes to them directly - every run now
+# gets its own numbered directory under RUNS_ROOT (see experiment.py),
+# and main() uses that run's log_path/plots_dir instead.
 LOG_PATH = os.path.join("eureka", "eureka_log.json")
 PLOTS_DIR = os.path.join("eureka", "plots")
+RUNS_ROOT = "runs"
 
 
 def _log_banner():
@@ -774,11 +785,31 @@ def _finalize_successful_generation(
         },
     )
 
+    winner_for_display = representative if MULTI_OBJECTIVE_MODE == "pareto" else generation_best
+    print_generation_table(
+        generation=generation,
+        front_candidates=[generation_results[index] for index in generation_fronts[0]],
+        winner_module_path=winner_for_display["module_path"] if winner_for_display else None,
+        reason=generation_reason(generation_record),
+    )
+
     return GenerationOutcome(
         pareto_archive=pareto_archive,
         generation_best=generation_best,
         representative=representative,
     )
+
+
+@dataclass
+class RunFinalization:
+    """What main() needs back from _finalize_run to drive the new
+    experiment-manager artifacts step (CSV export, HTML report, checkpoint
+    archiving) - the CONFIRMED final archive and representative, not the
+    pre-confirmation values main() already had."""
+
+    pareto_archive: list[dict]
+    representative: Optional[dict]
+    best: Optional[dict]
 
 
 def _finalize_run(
@@ -788,13 +819,19 @@ def _finalize_run(
     best: Optional[dict],
     run_start: float,
     empty_generations: list[int],
-) -> None:
+    log_path: str,
+    plots_dir: str,
+) -> RunFinalization:
     """
     Everything that happens once the generation loop is done: multi-seed
     confirmation of the final archive, writing the final log, the
     end-of-run plot, and the final summary log lines (including the
     impossible-to-miss warning when one or more generations lost their
     entire LLM candidate budget).
+
+    log_path/plots_dir are passed explicitly (rather than read from
+    module-level LOG_PATH/PLOTS_DIR constants) so each run can be pointed
+    at its own experiment directory - see ExperimentRun in experiment.py.
     """
     pareto_archive = _confirm_archive(pareto_archive, telemetry)
     representative = select_representative(pareto_archive, OBJECTIVE_SPECS)
@@ -802,7 +839,7 @@ def _finalize_run(
         best = representative
     if full_log:
         full_log[-1]["final_archive"] = pareto_archive
-        with open(LOG_PATH, "w", encoding="utf-8") as f:
+        with open(log_path, "w", encoding="utf-8") as f:
             json.dump(_json_safe(full_log), f, indent=2, default=str, allow_nan=False)
 
     total_duration = round(time.perf_counter() - run_start, 4)
@@ -828,7 +865,7 @@ def _finalize_run(
 
     try:
         from eureka.plots import generate_run_plots
-        plot_path = generate_run_plots(full_log, pareto_archive, PLOTS_DIR)
+        plot_path = generate_run_plots(full_log, pareto_archive, plots_dir)
         logger.info("run plots saved", extra={"event": "plots_saved", "path": plot_path})
         telemetry.record("plots_saved", path=plot_path)
     except Exception as e:
@@ -836,7 +873,7 @@ def _finalize_run(
 
     if best is None:
         logger.warning("run finished with no successful candidate", extra={"event": "run_empty"})
-        return
+        return RunFinalization(pareto_archive=pareto_archive, representative=representative, best=best)
 
     # A run can "finish" with a usable archive while still having silently
     # lost one or more generations to LLM failures. Surface that loudly in
@@ -871,6 +908,102 @@ def _finalize_run(
             },
         )
 
+    return RunFinalization(pareto_archive=pareto_archive, representative=representative, best=best)
+
+
+def _archive_reflection_prompts(run: ExperimentRun, generation: int, reflection_context) -> None:
+    """
+    Archives the LLM reflection prompt(s) that will be used to produce
+    this generation's candidates, for the report's "Reflection" section
+    and offline inspection - mirrors generate_candidates()'s own role-
+    cycling (see REFLECTION_TARGET_ROLES in llm_reward_designer.py)
+    exactly, WITHOUT calling into or modifying generate_candidates()
+    itself: this rebuilds the same prompt text via the same
+    build_reflection() call generate_candidates() makes internally, using
+    the exact same reflection_context this generation actually received.
+
+    Best-effort: archiving a prompt is a reporting nicety, never a reason
+    to fail a generation that would otherwise succeed.
+    """
+    try:
+        if not reflection_context:
+            run.archive_reflection_prompt(generation, 0, None, build_reflection(None))
+            return
+        roles = REFLECTION_TARGET_ROLES[: min(K_CANDIDATES, len(REFLECTION_TARGET_ROLES))]
+        for index, role in enumerate(roles):
+            prompt = build_reflection(reflection_context, target_role=role)
+            run.archive_reflection_prompt(generation, index, role, prompt)
+    except Exception as e:
+        logger.warning(
+            "failed to archive reflection prompt",
+            extra={"event": "reflection_archive_failed", "generation": generation, "reason": str(e)},
+        )
+
+
+def _finalize_experiment_artifacts(
+    run: ExperimentRun,
+    finalization: RunFinalization,
+    full_log: list[dict],
+    telemetry: Telemetry,
+    metadata,
+    run_start: float,
+) -> None:
+    """
+    New, additive experiment-manager finalization, run after
+    _finalize_run's algorithm-level finalization (confirmation, plots,
+    summary logs): archives final checkpoints/reward code, exports CSVs,
+    writes the self-contained HTML report, updates metadata.json with the
+    final execution time, and prints the console FINAL RESULTS banner.
+
+    Every step here is best-effort and independently wrapped: a failure
+    generating the HTML report (say) must never look like the search
+    itself failed, and must never prevent the other artifacts (CSVs,
+    checkpoints, metadata) from still being written.
+    """
+    pareto_archive = finalization.pareto_archive
+    representative = finalization.representative
+    best = finalization.best
+    representative_id = representative["candidate_id"] if representative else None
+
+    for candidate in pareto_archive:
+        checkpoint = candidate.get("checkpoint")
+        if checkpoint:
+            run.archive_checkpoint(checkpoint)
+
+    if best is not None and best.get("code"):
+        run.archive_final_reward(best["code"])
+
+    try:
+        export_all(full_log, pareto_archive, run.run_dir, representative_id=representative_id)
+    except Exception as e:
+        logger.warning("CSV export failed", extra={"event": "csv_export_failed", "reason": str(e)})
+
+    total_duration = round(time.perf_counter() - run_start, 4)
+    metadata_payload = run.write_metadata(metadata, execution_time_s=total_duration)
+
+    try:
+        execution_stats = compute_execution_stats(run.telemetry_path, total_runtime_s=total_duration)
+        generate_html_report(
+            run_dir=run.run_dir,
+            full_log=full_log,
+            archive=pareto_archive,
+            representative_id=representative_id,
+            metadata=metadata_payload,
+            config=build_experiment_config_snapshot(),
+            execution_stats=execution_stats,
+            plots_dir=run.plots_dir,
+            reflection_dir=run.reflection_dir,
+        )
+        logger.info(
+            "HTML report generated",
+            extra={"event": "report_generated", "path": str(run.report_html_path)},
+        )
+    except Exception as e:
+        logger.warning("HTML report generation failed", extra={"event": "report_failed", "reason": str(e)})
+
+    summary = f"{len(pareto_archive)} candidates in final archive, {N_GENERATIONS} generations requested."
+    print_final_results_banner(pareto_archive, representative_id, summary)
+
 
 def main():
     if MULTI_OBJECTIVE_MODE not in {"shadow", "pareto"}:
@@ -879,87 +1012,114 @@ def main():
             f"got {MULTI_OBJECTIVE_MODE!r}"
         )
     os.makedirs(CANDIDATES_DIR, exist_ok=True)
-    telemetry = Telemetry()
-    _log_banner()
 
-    best = None
-    pareto_archive: list[dict] = []
-    full_log: list[dict] = []
-    run_start = time.perf_counter()
-    # Tracks how many generations returned zero candidates from the LLM
-    # (e.g. every call failed with RequestTooLargeError even after the one
-    # retry in generate_candidates, or every response was unparseable) so
-    # a run silently losing part of its search budget is surfaced loudly
-    # at the end instead of requiring someone to notice the archive was
-    # smaller than expected.
-    empty_generations: list[int] = []
+    # Every invocation gets its own numbered runs/run_NNNN/ directory -
+    # nothing overwrites a previous run. See experiment.py for exactly
+    # which files stay in their existing shared locations (candidate
+    # source under eureka/candidates/, checkpoints under
+    # eureka/checkpoints/ - both required by sandbox.py's dotted-module-
+    # path loading and train_candidate.py's confirmation-run reuse) versus
+    # which are archived into / written directly to the run directory.
+    run = ExperimentRun.start(runs_root=RUNS_ROOT)
+    metadata = collect_run_metadata(GROQ_MODEL)
+    run.write_config_snapshot(build_experiment_config_snapshot())
+    run.write_metadata(metadata)
 
-    for generation in range(N_GENERATIONS):
-        gen_start = time.perf_counter()
-        logger.info("generation started", extra={"event": "generation_start", "generation": generation})
-
+    with run.capture_console():
+        telemetry = Telemetry(path=str(run.telemetry_path))
+        _log_banner()
         logger.info(
-            "requesting LLM candidates",
-            extra={"event": "llm_request", "generation": generation, "k": K_CANDIDATES},
+            "run directory created",
+            extra={"event": "run_dir_created", "run": run.run_name, "path": str(run.run_dir)},
         )
-        if MULTI_OBJECTIVE_MODE == "pareto":
-            reflection_context = select_reflection_elites(
-                pareto_archive, OBJECTIVE_SPECS, REFLECTION_ELITES
+
+        best = None
+        pareto_archive: list[dict] = []
+        full_log: list[dict] = []
+        run_start = time.perf_counter()
+        # Tracks how many generations returned zero candidates from the LLM
+        # (e.g. every call failed with RequestTooLargeError even after the one
+        # retry in generate_candidates, or every response was unparseable) so
+        # a run silently losing part of its search budget is surfaced loudly
+        # at the end instead of requiring someone to notice the archive was
+        # smaller than expected.
+        empty_generations: list[int] = []
+
+        for generation in range(N_GENERATIONS):
+            gen_start = time.perf_counter()
+            logger.info("generation started", extra={"event": "generation_start", "generation": generation})
+
+            logger.info(
+                "requesting LLM candidates",
+                extra={"event": "llm_request", "generation": generation, "k": K_CANDIDATES},
             )
-        else:
-            reflection_context = best
-        with telemetry.timed("llm_generation", generation=generation, k=K_CANDIDATES) as llm_ctx:
-            candidates_code = generate_candidates(
-                reflection_context, k=K_CANDIDATES, generation=generation,
-                model=GROQ_MODEL, temperature=LLM_TEMPERATURE,
-            )
-            llm_ctx["n_received"] = len(candidates_code)
-
-        human_seed_index = None
-        if generation == 0 and SEED_GENERATION_0_WITH_HUMAN_REWARD:
-            from eureka.human_seed import HUMAN_SEED_CODE
-            candidates_code = [HUMAN_SEED_CODE] + list(candidates_code)
-            human_seed_index = 0
-
-        if not candidates_code:
-            empty_generations.append(generation)
-            _record_empty_generation(generation, pareto_archive, full_log, telemetry, gen_start)
-            continue
-
-        survivors = _smoke_test_and_save(candidates_code, generation, human_seed_index, telemetry)
-        generation_results = _train_and_evaluate_generation(survivors, generation, telemetry)
-        gen_duration = round(time.perf_counter() - gen_start, 4)
-
-        if not generation_results:
-            _record_generation_with_no_survivors(
-                generation, pareto_archive, full_log, telemetry, gen_duration
-            )
-            continue
-
-        outcome = _finalize_successful_generation(
-            generation, generation_results, pareto_archive, full_log, telemetry, gen_duration,
-        )
-        pareto_archive = outcome.pareto_archive
-
-        if MULTI_OBJECTIVE_MODE == "shadow":
-            if best is None or outcome.generation_best["fitness"] > best["fitness"]:
-                best = outcome.generation_best
-                logger.info(
-                    "new legacy scalar best (shadow mode)",
-                    extra={
-                        "event": "new_legacy_best",
-                        "legacy_fitness": best["fitness"],
-                        "module_path": best["module_path"],
-                    },
+            if MULTI_OBJECTIVE_MODE == "pareto":
+                reflection_context = select_reflection_elites(
+                    pareto_archive, OBJECTIVE_SPECS, REFLECTION_ELITES
                 )
-        else:
-            best = outcome.representative
+            else:
+                reflection_context = best
+            _archive_reflection_prompts(run, generation, reflection_context)
 
-        with open(LOG_PATH, "w", encoding="utf-8") as f:
-            json.dump(_json_safe(full_log), f, indent=2, default=str, allow_nan=False)
-        logger.info("log updated", extra={"event": "log_write", "path": LOG_PATH})
+            with telemetry.timed("llm_generation", generation=generation, k=K_CANDIDATES) as llm_ctx:
+                candidates_code = generate_candidates(
+                    reflection_context, k=K_CANDIDATES, generation=generation,
+                    model=GROQ_MODEL, temperature=LLM_TEMPERATURE,
+                )
+                llm_ctx["n_received"] = len(candidates_code)
 
-    _finalize_run(pareto_archive, full_log, telemetry, best, run_start, empty_generations)
+            human_seed_index = None
+            if generation == 0 and SEED_GENERATION_0_WITH_HUMAN_REWARD:
+                from eureka.human_seed import HUMAN_SEED_CODE
+                candidates_code = [HUMAN_SEED_CODE] + list(candidates_code)
+                human_seed_index = 0
+
+            if not candidates_code:
+                empty_generations.append(generation)
+                _record_empty_generation(generation, pareto_archive, full_log, telemetry, gen_start)
+                continue
+
+            survivors = _smoke_test_and_save(candidates_code, generation, human_seed_index, telemetry)
+            for survivor in survivors:
+                run.archive_candidate_code(f"gen{generation}_cand{survivor['k']}", survivor["code"])
+
+            generation_results = _train_and_evaluate_generation(survivors, generation, telemetry)
+            gen_duration = round(time.perf_counter() - gen_start, 4)
+
+            if not generation_results:
+                _record_generation_with_no_survivors(
+                    generation, pareto_archive, full_log, telemetry, gen_duration
+                )
+                continue
+
+            outcome = _finalize_successful_generation(
+                generation, generation_results, pareto_archive, full_log, telemetry, gen_duration,
+            )
+            pareto_archive = outcome.pareto_archive
+
+            if MULTI_OBJECTIVE_MODE == "shadow":
+                if best is None or outcome.generation_best["fitness"] > best["fitness"]:
+                    best = outcome.generation_best
+                    logger.info(
+                        "new legacy scalar best (shadow mode)",
+                        extra={
+                            "event": "new_legacy_best",
+                            "legacy_fitness": best["fitness"],
+                            "module_path": best["module_path"],
+                        },
+                    )
+            else:
+                best = outcome.representative
+
+            with open(run.log_path, "w", encoding="utf-8") as f:
+                json.dump(_json_safe(full_log), f, indent=2, default=str, allow_nan=False)
+            logger.info("log updated", extra={"event": "log_write", "path": str(run.log_path)})
+
+        finalization = _finalize_run(
+            pareto_archive, full_log, telemetry, best, run_start, empty_generations,
+            log_path=str(run.log_path), plots_dir=str(run.plots_dir),
+        )
+        _finalize_experiment_artifacts(run, finalization, full_log, telemetry, metadata, run_start)
 
 
 if __name__ == "__main__":

@@ -70,6 +70,15 @@ Constraints:
   definition. No explanation, no other text.
 """
 
+# The per-candidate reflection target roles cycled through in
+# generate_candidates() below when elites are available (i.e. every
+# generation after the first). Hoisted to module level - rather than a
+# local literal inside generate_candidates() - purely so other modules
+# (e.g. loop.py, archiving the reflection prompt actually used for a
+# generation) can reference the exact same tuple instead of duplicating
+# it; the cycling logic and values are unchanged.
+REFLECTION_TARGET_ROLES = ("balanced_knee", "safest", "fastest_safe", "overtaking_safe")
+
 
 def _extract_code(text: str) -> str | None:
     match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
@@ -134,7 +143,7 @@ def generate_candidates(elites: dict | list[dict] | None, k: int, generation: in
     manager = get_key_manager()
 
     candidates = []
-    roles = ("balanced_knee", "safest", "fastest_safe", "overtaking_safe")
+    roles = REFLECTION_TARGET_ROLES
     for i in range(k):
         target_role = roles[i % len(roles)] if elites else None
         user_prompt = build_reflection(elites, target_role=target_role)

@@ -187,6 +187,72 @@ def print_final_archive_table(archive: list[dict], representative_id: str | None
     sys.stdout.flush()
 
 
+def print_generation_table(
+    generation: int,
+    front_candidates: list[dict],
+    winner_module_path: str | None,
+    reason: str,
+) -> None:
+    """
+    Prints the "at the end of every generation" console table: the
+    generation's Pareto front (rank/candidate/crash/speed/overtakes), then
+    the generation winner and why it was picked. Purely a console
+    rendering of data loop.py already has by the time a generation
+    finishes (front_candidates from eureka.objectives.annotate_population,
+    the winner/representative id, and the same reason logic report_html.py
+    uses) - no new selection or ranking logic here.
+    """
+    banner = "=" * 68
+    lines = [banner, f"Generation {generation}", "Pareto Front", banner]
+
+    if not front_candidates:
+        lines.append("  (no candidates on the Pareto front this generation)")
+    else:
+        lines.append("  rank  candidate                  crash   speed   otk")
+        lines.append("  ----  ------------------------- ------  ------  -----")
+        for candidate in sorted(front_candidates, key=lambda c: c.get("crowding_distance", 0.0), reverse=True):
+            module_path = str(candidate.get("module_path", "?"))
+            short_name = module_path.rsplit(".", 1)[-1]
+            is_winner = module_path == winner_module_path
+            label = f"{short_name} (WINNER)" if is_winner else short_name
+            metrics = candidate.get("metrics", {})
+            rank = candidate.get("pareto_rank", "?")
+            lines.append(
+                f"   {str(rank):>3}  {label:<27}"
+                f"{_fmt_num(float(metrics.get('crash_rate', float('nan'))) * 100, 5, 1)}% "
+                f"{_fmt_num(metrics.get('mean_speed', float('nan')), 6, 1)} "
+                f"{_fmt_num(metrics.get('mean_overtakes', float('nan')), 5, 2)}"
+            )
+
+    lines.append(banner)
+    winner_short = winner_module_path.rsplit(".", 1)[-1] if winner_module_path else "(none)"
+    lines.append(f"Generation Winner: {winner_short}")
+    lines.append(f"Reason: {reason}")
+    lines.append(banner)
+    lines.append("")
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def print_final_results_banner(
+    archive: list[dict], representative_id: str | None, summary: str,
+) -> None:
+    """
+    Prints the end-of-experiment "FINAL RESULTS" banner (Step 6), then
+    delegates the actual archive table to print_final_archive_table so
+    there's exactly one implementation of "how to render a Pareto
+    archive as text" rather than two slightly-different copies.
+    """
+    banner = "=" * 68
+    sys.stdout.write(f"\n{banner}\nFINAL RESULTS\nGlobal Pareto Archive\n{banner}\n")
+    sys.stdout.flush()
+    print_final_archive_table(archive, representative_id)
+    winner = next((c for c in archive if c.get("candidate_id") == representative_id), None)
+    winner_name = str(winner.get("module_path", "?")).rsplit(".", 1)[-1] if winner else "(none)"
+    sys.stdout.write(f"Winner: {winner_name}\nSummary: {summary}\n{banner}\n\n")
+    sys.stdout.flush()
+
+
 def _format_context(record: logging.LogRecord) -> str:
     event = getattr(record, "event", None)
     data = _extract_extras(record)
