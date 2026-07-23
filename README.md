@@ -53,6 +53,7 @@ Other inspectable entrypoints:
 ```bash
 python env_utils.py                        # print obs/action space shapes
 python -m eureka.evaluate_cli --list       # inspect trained candidates outside the search loop
+python -m eureka.evaluate_run 6 --render   # re-evaluate/render a specific past run's winner
 python -m pytest eureka/tests/ -m "not integration"
 ```
 
@@ -85,6 +86,8 @@ eureka/
   logging_utils.py        # structured console (+ optional JSONL, generation/final-results tables)
   telemetry.py            # per-run telemetry.jsonl event stream
   evaluate_cli.py         # standalone CLI: evaluate/render any trained candidate
+  evaluate_run.py         # re-evaluate/render a SPECIFIC past run's winner (uses that
+                          # run's archived candidate/checkpoint, not the live shared ones)
   experiment.py           # ExperimentRun: numbered runs/run_NNNN/ directories
   run_metadata.py         # git/OS/CPU/RAM metadata collection (best-effort)
   csv_export.py           # pareto_archive / generation_summary / candidate_metrics CSVs
